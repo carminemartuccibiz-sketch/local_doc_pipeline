@@ -1,0 +1,22 @@
+# Runtime e dati generati
+.env
+.env.local
+.venv/
+01_RAW_INGEST/
+02_SESSION_MEMORY/
+.staging_md/
+logs/
+gap_allm_state.json
+pipeline_state.json
+pipeline_state.json.tmp
+ingest_manifest.json
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# IDE
+.cursor/
+.idea/
+.vscode/
