@@ -9,6 +9,7 @@ from typing import Any
 
 import httpx
 
+from clients.http_helpers import lm_request
 from config import (
     LM_API_KEY,
     LM_MODEL,
@@ -49,6 +50,18 @@ def _headers() -> dict[str, str]:
     return h
 
 
+def _http_request(
+    method: str,
+    url: str,
+    *,
+    timeout: float = LM_TIMEOUT_S,
+    **kwargs: Any,
+) -> httpx.Response:
+    """Wrap HTTP verso LM Studio con interaction log (rolling 5)."""
+    with httpx.Client(timeout=timeout, headers=_headers()) as client:
+        return lm_request(client, method, url, **kwargs)
+
+
 def _parse_native_response(data: dict[str, Any]) -> str:
     from core.ai_tasks import parse_lm_native_response
 
@@ -73,18 +86,24 @@ class LMStudioClient:
 
     def health(self) -> bool:
         try:
-            with httpx.Client(timeout=15.0, headers=_headers()) as c:
-                r = c.get(f"{LM_OPENAI_BASE_URL}/models")
-                return r.status_code == 200
+            r = _http_request(
+                "GET",
+                f"{LM_OPENAI_BASE_URL.rstrip('/')}/models",
+                timeout=15.0,
+            )
+            return r.status_code == 200
         except httpx.RequestError:
             return False
 
     def list_models(self) -> list[str]:
         try:
-            with httpx.Client(timeout=15.0, headers=_headers()) as c:
-                r = c.get(f"{LM_OPENAI_BASE_URL}/models")
-                r.raise_for_status()
-                data = r.json()
+            r = _http_request(
+                "GET",
+                f"{LM_OPENAI_BASE_URL.rstrip('/')}/models",
+                timeout=15.0,
+            )
+            r.raise_for_status()
+            data = r.json()
             return [m.get("id", "") for m in data.get("data", []) if m.get("id")]
         except Exception:
             return []

@@ -11,6 +11,7 @@ from typing import Any
 
 import httpx
 
+from clients.http_helpers import allm_request
 from config import (
     ALLM_TIMEOUT_S,
     ANYTHINGLLM_API_KEY,
@@ -43,21 +44,25 @@ class AnythingLLMClient:
     def _url(self, path: str) -> str:
         return f"{self.base_url}/api{path}"
 
+    def _http(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+        """Richiesta HTTP tracciata (rolling log ultime 5 interazioni)."""
+        timeout = kwargs.pop("timeout", self.timeout)
+        with httpx.Client(timeout=timeout, headers=self._headers) as c:
+            return allm_request(c, method, url, **kwargs)
+
     def health(self) -> bool:
         try:
-            with httpx.Client(timeout=10.0, headers=self._headers) as c:
-                r = c.get(self._url("/ping"))
-                return r.status_code == 200
+            r = self._http("GET", self._url("/ping"), timeout=10.0)
+            return r.status_code == 200
         except httpx.RequestError:
             return False
 
     def get_workspace(self, slug: str) -> dict[str, Any]:
-        with httpx.Client(timeout=self.timeout, headers=self._headers) as c:
-            r = c.get(self._url(f"/v1/workspace/{slug}"))
-            if r.status_code == 404:
-                return {}
-            r.raise_for_status()
-            data = r.json()
+        r = self._http("GET", self._url(f"/v1/workspace/{slug}"))
+        if r.status_code == 404:
+            return {}
+        r.raise_for_status()
+        data = r.json()
         return dict(data.get("workspace") or data or {})
 
     def list_workspace_document_keys(self, workspace_slug: str) -> set[str]:
@@ -124,15 +129,14 @@ class AnythingLLMClient:
         return keys
 
     def list_workspaces(self) -> list[dict[str, Any]]:
-        with httpx.Client(timeout=self.timeout, headers=self._headers) as c:
-            r = c.get(self._url("/v1/workspaces"))
-            if r.status_code == 403:
-                raise AnythingLLMError(
-                    "API key AnythingLLM mancante o non valida. "
-                    "Imposta ANYTHINGLLM_API_KEY (Settings → API Keys)."
-                )
-            r.raise_for_status()
-            data = r.json()
+        r = self._http("GET", self._url("/v1/workspaces"))
+        if r.status_code == 403:
+            raise AnythingLLMError(
+                "API key AnythingLLM mancante o non valida. "
+                "Imposta ANYTHINGLLM_API_KEY (Settings → API Keys)."
+            )
+        r.raise_for_status()
+        data = r.json()
         return list(data.get("workspaces") or [])
 
     def ensure_workspace(
@@ -153,12 +157,11 @@ class AnythingLLMClient:
             "topN": 8,
             "similarityThreshold": 0.25,
         }
-        with httpx.Client(timeout=self.timeout, headers=self._headers) as c:
-            r = c.post(self._url("/v1/workspace/new"), json=payload)
-            if r.status_code == 403:
-                raise AnythingLLMError("Forbidden — verifica ANYTHINGLLM_API_KEY")
-            r.raise_for_status()
-            data = r.json()
+        r = self._http("POST", self._url("/v1/workspace/new"), json=payload)
+        if r.status_code == 403:
+            raise AnythingLLMError("Forbidden — verifica ANYTHINGLLM_API_KEY")
+        r.raise_for_status()
+        data = r.json()
         ws = data.get("workspace") or {}
         out_slug = str(ws.get("slug") or slug)
         logger.info("Workspace creato: %s → slug=%s", name, out_slug)
@@ -182,18 +185,22 @@ class AnythingLLMClient:
 
             meta_json = _json.dumps(metadata)
 
-        with httpx.Client(timeout=self.timeout, headers=self._headers) as c:
-            with file_path.open("rb") as fh:
-                files = {"file": (file_path.name, fh, "text/markdown")}
-                data: dict[str, str] = {"addToWorkspaces": workspace_slug}
-                if meta_json:
-                    data["metadata"] = meta_json
-                r = c.post(self._url("/v1/document/upload"), files=files, data=data)
-            if r.status_code == 403:
-                raise AnythingLLMError("Upload forbidden — API key?")
-            if r.status_code >= 400:
-                raise AnythingLLMError(f"Upload failed {r.status_code}: {r.text[:500]}")
-            body = r.json()
+        with file_path.open("rb") as fh:
+            files = {"file": (file_path.name, fh, "text/markdown")}
+            data: dict[str, str] = {"addToWorkspaces": workspace_slug}
+            if meta_json:
+                data["metadata"] = meta_json
+            r = self._http(
+                "POST",
+                self._url("/v1/document/upload"),
+                files=files,
+                data=data,
+            )
+        if r.status_code == 403:
+            raise AnythingLLMError("Upload forbidden — API key?")
+        if r.status_code >= 400:
+            raise AnythingLLMError(f"Upload failed {r.status_code}: {r.text[:500]}")
+        body = r.json()
 
         locations: list[str] = []
         for doc in body.get("documents") or []:
@@ -236,8 +243,7 @@ class AnythingLLMClient:
                     t,
                     attempt,
                 )
-                with httpx.Client(timeout=t, headers=self._headers) as c:
-                    r = c.post(url, json=payload)
+                r = self._http("POST", url, json=payload, timeout=t)
                 if r.status_code >= 400:
                     raise AnythingLLMError(
                         f"update-embeddings HTTP {r.status_code}: {r.text[:500]}"
@@ -287,13 +293,13 @@ class AnythingLLMClient:
             "topN": top_n,
             "scoreThreshold": score_threshold,
         }
-        with httpx.Client(timeout=self.timeout, headers=self._headers) as c:
-            r = c.post(
-                self._url(f"/v1/workspace/{workspace_slug}/vector-search"),
-                json=payload,
-            )
-            if r.status_code >= 400:
-                logger.warning("vector-search fallita: %s", r.text[:300])
-                return []
-            data = r.json()
+        r = self._http(
+            "POST",
+            self._url(f"/v1/workspace/{workspace_slug}/vector-search"),
+            json=payload,
+        )
+        if r.status_code >= 400:
+            logger.warning("vector-search fallita: %s", r.text[:300])
+            return []
+        data = r.json()
         return list(data.get("results") or [])

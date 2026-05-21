@@ -7,5 +7,10 @@ beautifulsoup4>=4.12,<5
 pypdf>=4.0
 python-docx>=1.1
 
+# UI orchestratore desktop (FASE 6–8)
+flask>=3.0,<4.0
+flask-cors>=4.0,<5.0
+pywebview>=5.0,<6.0
+
 # Opzionale — PDF/DOCX migliori (come Motore_Dvamocles)
 # unstructured[pdf,docx]>=0.14.0

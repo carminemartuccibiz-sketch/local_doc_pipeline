@@ -40,7 +40,7 @@ try {
     exit 2
 }
 
-$argsList = @("orchestrator.py")
+$argsList = @("legacy\orchestrator_v1.py")
 if (-not $FullIngest) { $argsList += "--skip-ingest" }
 $argsList += "--limit", $Limit
 if (-not $SingleRun) { $argsList += "--continuous" }

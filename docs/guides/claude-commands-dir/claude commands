@@ -1,0 +1,845 @@
+# Blueprint: Local AI Orchestrator Desktop — Evoluzione da CLI a UI
+
+---
+
+## Task 1 — Cosa tenere e cosa buttare
+
+### ✅ Tenere (logica solida, riusabile)
+
+| Modulo attuale | Motivo |
+|----------------|--------|
+| `core/session_state.py` | State machine fault-tolerant, già versioned — adattarla come "Job State" |
+| `core/ai_tasks.py` | `llm_complete`, `discover_lm_studio_model`, `parse_lm_native_response` — sono il motore LLM |
+| `core/chunking.py` | Split markdown con merge piccole sezioni — estenderlo con overlap |
+| `core/token_budget.py` | `resolve_token_limits`, `count_tokens` — già parametrici |
+| `core/gap_allm.py` | `fetch_sot_rag_context`, `resolve_sot_workspace_slug` — RAG rimane utile |
+| `core/file_io.py` | `atomic_write_json` — scrittura safe su Windows, fondamentale |
+| `anythingllm_client.py` | Client REST completo con `list_workspace_document_keys` |
+| `config/hardware_profiles.py` | Profili già strutturati — diventano la base del Profile Manager |
+| `converters.py` | Multi-format extract (PDF, DOCX, HTML) — riusato pari pari |
+
+### 🗑️ Buttare / Isolare in `legacy/`
+
+| Modulo attuale | Motivo |
+|----------------|--------|
+| `pipeline.py` + `local_doc_pipeline.py` | Flusso extract legacy, non più il percorso principale |
+| `lm_studio_client.py` | Ora è un wrapper di `core/ai_tasks` — eliminare, fare delega diretta |
+| `orchestrator.py` | Sostituito dal nuovo `engine/orchestrator.py` con threading |
+| `cli.py` (come entry point) | Diventa un fallback CLI; l'entry point principale è la UI |
+| `start_dvamocles_pipeline.*` | Sostituiti dagli script di avvio UI |
+
+### 🔄 Da refactorare profondamente
+
+`core/gap_runner.py` → diventa `engine/workflow_gap.py` (workflow plugin), la logica di Sliding Window va in un nuovo `engine/ingest_processor.py`.
+
+---
+
+## Task 2 — Blueprint delle Directory
+
+```
+local_ai_orchestrator/
+│
+├── app.py                          # Entry point UI (Electron o PyWebView/Tkinter)
+├── server.py                       # Backend Flask/FastAPI con SSE per log streaming
+│
+├── engine/                         # Core motore (agnostico da UI e da progetto)
+│   ├── __init__.py
+│   ├── orchestrator.py             # ThreadPoolExecutor + event bus + kill switch
+│   ├── job_queue.py                # Coda priorità job, status, cancellazione
+│   ├── ingest_processor.py         # *** NUOVO: Sliding Window logic ***
+│   ├── model_router.py             # Auto-discovery + routing modello per task type
+│   ├── workflow_runner.py          # Plugin loader workflow (gap, blog, code analysis...)
+│   └── cooldown_manager.py         # Pausa/cooldown tra chunk e tra file
+│
+├── workflows/                      # Workflow come plugin intercambiabili
+│   ├── __init__.py
+│   ├── base_workflow.py            # ABC: process_file(file, ctx) -> Result
+│   ├── gap_analysis.py             # Workflow refactoring documentale (portato da gap_runner)
+│   ├── blog_post.py                # Workflow generazione post (stub)
+│   └── code_analysis.py            # Workflow analisi codice (stub)
+│
+├── projects/                       # ROOT cartella progetti (una subdirectory per progetto)
+│   └── <PROJECT_SLUG>/
+│       ├── project.json            # Config progetto (nome, workflow attivo, profilo HW)
+│       ├── 01_INGEST/              # File grezzi copiati (deduplica MD5)
+│       │   └── <original_name>/    # *** Cartella isolata per file ***
+│       │       ├── original.<ext>  # File originale
+│       │       ├── chunks.json     # Mappa chunk (index, char_start, char_end, token_count)
+│       │       ├── chunk_001.txt   # Testo chunk 001
+│       │       ├── chunk_002.txt   # ...
+│       │       └── analysis.md     # Documento tracciamento (aggiornato chunk per chunk)
+│       ├── 02_REFERENCE/           # File di riferimento/SOT (assegnati dall'utente)
+│       │   └── file_roles.json     # {"path/to/file.md": "SOT", "other.md": "Reference"}
+│       ├── 03_OUTPUT/              # Output workflow (gap report, post generati, ecc.)
+│       └── 04_MEMORY/              # State pipeline + cache AnythingLLM
+│           ├── pipeline_state.json
+│           ├── gap_allm_state.json
+│           └── ingest_manifest.json
+│
+├── core/                           # Utility riusabili (portate dall'attuale codebase)
+│   ├── ai_tasks.py                 # llm_complete, discover_lm_studio_model — invariato
+│   ├── chunking.py                 # + overlap support
+│   ├── token_budget.py             # invariato
+│   ├── context_budget.py           # invariato
+│   ├── file_io.py                  # atomic_write_json — invariato
+│   ├── session_state.py            # adattato per path progetto dinamico
+│   └── converters.py               # invariato
+│
+├── clients/                        # Client AI (refactored da root)
+│   ├── lm_studio.py                # Unico client LM Studio (merge ai_tasks + lm_studio_client)
+│   └── anythingllm.py              # Portato da anythingllm_client.py
+│
+├── config/
+│   ├── hardware_profiles.py        # Profili HW (già esistente, adattato)
+│   ├── model_task_map.py           # *** NUOVO: quale modello per quale task ***
+│   └── defaults.py                 # Costanti globali
+│
+├── ui/                             # Frontend (PyWebView + HTML/JS oppure Electron)
+│   ├── static/
+│   │   ├── app.js
+│   │   └── style.css
+│   └── templates/
+│       └── index.html
+│
+├── legacy/                         # Codice vecchio (non cancellare subito)
+│   ├── pipeline.py
+│   ├── local_doc_pipeline.py
+│   └── orchestrator_v1.py
+│
+├── .env.example
+├── requirements.txt
+└── README.md
+```
+
+### `chunks.json` — Formato mappa chunk
+
+```json
+{
+  "source_file": "original_name.md",
+  "source_md5": "abc123...",
+  "chunked_at": "2026-05-21T19:00:00Z",
+  "chunk_strategy": "markdown_sections_overlap",
+  "overlap_tokens": 150,
+  "total_chunks": 12,
+  "chunks": [
+    {
+      "index": 0,
+      "label": "## Introduzione",
+      "char_start": 0,
+      "char_end": 3200,
+      "token_estimate": 820,
+      "overlap_with_next_chars": 400
+    },
+    {
+      "index": 1,
+      "label": "## Architettura",
+      "char_start": 2800,
+      "char_end": 6100,
+      "token_estimate": 850,
+      "overlap_with_prev_chars": 400
+    }
+  ]
+}
+```
+
+---
+
+## Task 3 — Kill Switch: Logica e Snippet
+
+Il problema che hai descritto è reale: LM Studio accoda le richieste HTTP lato server. `Ctrl+C` interrompe il Python ma la richiesta è già in volo. La soluzione è un **abort a tre livelli**.
+
+```python
+# engine/orchestrator.py
+
+import threading
+import httpx
+from queue import Queue, Empty
+from dataclasses import dataclass, field
+from typing import Callable
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class OrchestratorState:
+    stop_event: threading.Event = field(default_factory=threading.Event)
+    active_requests: list[httpx.Client] = field(default_factory=list)
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def register_client(self, client: httpx.Client) -> None:
+        with self._lock:
+            self.active_requests.append(client)
+
+    def unregister_client(self, client: httpx.Client) -> None:
+        with self._lock:
+            try:
+                self.active_requests.remove(client)
+            except ValueError:
+                pass
+
+    def kill_all(self) -> None:
+        """
+        Livello 1: segnala stop a tutti i thread worker.
+        Livello 2: chiude i client httpx attivi (annulla richieste in volo).
+        Livello 3: svuota la job queue.
+        """
+        logger.warning("KILL SWITCH attivato")
+        self.stop_event.set()
+
+        # Livello 2: forza chiusura connessioni HTTP aperte
+        with self._lock:
+            for client in list(self.active_requests):
+                try:
+                    client.close()
+                    logger.info("Client HTTP chiuso: %s", id(client))
+                except Exception:
+                    pass
+            self.active_requests.clear()
+
+
+# Singleton globale condiviso con la UI
+_state = OrchestratorState()
+
+
+def get_orchestrator_state() -> OrchestratorState:
+    return _state
+
+
+def reset_orchestrator() -> None:
+    global _state
+    _state = OrchestratorState()
+```
+
+```python
+# Integrazione in llm_complete (core/ai_tasks.py) — modifica chiave
+
+def llm_complete(*, system_prompt: str, user_message: str, ...) -> str:
+    from engine.orchestrator import get_orchestrator_state
+    state = get_orchestrator_state()
+
+    if state.stop_event.is_set():
+        raise InterruptedError("Pipeline fermata dall'utente (Kill Switch)")
+
+    # Client registrato PRIMA della chiamata
+    client = httpx.Client(timeout=LM_TIMEOUT_S, headers=_auth_headers())
+    state.register_client(client)
+    try:
+        r = client.post(url, json=payload)
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"].strip()
+    except httpx.HTTPError as e:
+        if state.stop_event.is_set():
+            raise InterruptedError("Richiesta annullata da Kill Switch") from e
+        raise
+    finally:
+        state.unregister_client(client)
+        client.close()
+```
+
+```python
+# server.py — endpoint Flask per la UI
+
+from flask import Flask, jsonify
+from engine.orchestrator import get_orchestrator_state, reset_orchestrator
+
+app = Flask(__name__)
+
+@app.post("/api/stop")
+def api_stop():
+    """Chiamato dal pulsante STOP nella UI."""
+    get_orchestrator_state().kill_all()
+    return jsonify({"status": "stopped", "message": "Pipeline fermata."})
+
+@app.post("/api/reset")
+def api_reset():
+    """Reset per avviare un nuovo job dopo lo stop."""
+    reset_orchestrator()
+    return jsonify({"status": "ready"})
+```
+
+```javascript
+// ui/static/app.js — pulsante STOP
+
+document.getElementById('btn-stop').addEventListener('click', async () => {
+    const res = await fetch('/api/stop', { method: 'POST' });
+    const data = await res.json();
+    appendLog(`[STOP] ${data.message}`);
+    document.getElementById('btn-stop').disabled = true;
+    document.getElementById('btn-reset').disabled = false;
+});
+```
+
+**Perché funziona:** `client.close()` su un `httpx.Client` con richiesta in corso lancia `RemoteProtocolError` o `ReadError` nel thread worker, che viene intercettata e convertita in `InterruptedError` pulita. LM Studio riceve una chiusura TCP e abbandona l'inferenza dopo qualche secondo (non istantanea ma molto meglio di Ctrl+C senza cleanup).
+
+---
+
+## Task 4 — Snippet "Sliding Window Context"
+
+```python
+# engine/ingest_processor.py
+
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import Iterator
+
+from core.chunking import split_markdown_sections, TextChunk
+from core.token_budget import count_tokens, resolve_chunk_max_tokens
+from core.file_io import atomic_write_json
+
+logger = logging.getLogger(__name__)
+
+
+# ─── Strutture dati ────────────────────────────────────────────────────────────
+
+@dataclass
+class ChunkMeta:
+    index: int
+    label: str
+    char_start: int
+    char_end: int
+    token_estimate: int
+    overlap_with_prev_chars: int = 0
+    overlap_with_next_chars: int = 0
+
+
+@dataclass
+class ChunkAnalysis:
+    index: int
+    label: str
+    analysis: str        # Analisi estesa dell'AI
+    condensed: str       # Sommario stringato (~150 token) passato al chunk successivo
+
+
+@dataclass
+class FileIngestResult:
+    source_file: str
+    total_chunks: int
+    analyses: list[ChunkAnalysis] = field(default_factory=list)
+    final_summary: str = ""
+
+
+# ─── Chunking con overlap ──────────────────────────────────────────────────────
+
+OVERLAP_CHARS = 400   # ~100 token di sovrapposizione tra chunk adiacenti
+
+def _build_chunks_with_overlap(
+    body: str,
+    *,
+    max_tokens: int,
+    overlap_chars: int = OVERLAP_CHARS,
+) -> tuple[list[TextChunk], list[ChunkMeta]]:
+    """
+    Genera chunk logici (split su ##) e aggiunge overlap fisico
+    prendendo la coda del chunk precedente e incollandola all'inizio del successivo.
+    """
+    base_chunks = split_markdown_sections(body, max_tokens=max_tokens)
+
+    if len(base_chunks) <= 1:
+        meta = [ChunkMeta(0, base_chunks[0].label, 0, len(body), base_chunks[0].token_estimate)]
+        return base_chunks, meta
+
+    enriched_chunks: list[TextChunk] = []
+    metas: list[ChunkMeta] = []
+    char_cursor = 0
+
+    for i, chunk in enumerate(base_chunks):
+        overlap_prefix = ""
+        overlap_prev_chars = 0
+        if i > 0:
+            prev_text = base_chunks[i - 1].text
+            tail = prev_text[-overlap_chars:] if len(prev_text) > overlap_chars else prev_text
+            overlap_prefix = f"[...contesto dal blocco precedente...]\n{tail}\n\n"
+            overlap_prev_chars = len(tail)
+
+        enriched_text = overlap_prefix + chunk.text
+        enriched_chunks.append(TextChunk(
+            index=chunk.index,
+            label=chunk.label,
+            text=enriched_text,
+            token_estimate=count_tokens(enriched_text),
+        ))
+
+        char_end = char_cursor + len(chunk.text)
+        overlap_next = min(overlap_chars, len(chunk.text))
+        metas.append(ChunkMeta(
+            index=i,
+            label=chunk.label,
+            char_start=char_cursor,
+            char_end=char_end,
+            token_estimate=count_tokens(enriched_text),
+            overlap_with_prev_chars=overlap_prev_chars,
+            overlap_with_next_chars=overlap_next,
+        ))
+        char_cursor = char_end
+
+    return enriched_chunks, metas
+
+
+# ─── Sliding Window Loop ───────────────────────────────────────────────────────
+
+ANALYZE_SYSTEM_PROMPT = """Sei un analista documentale. Ti viene fornito un frammento di documento
+(con eventuale contesto dal frammento precedente).
+
+Produci:
+1. **ANALISI**: descrizione dettagliata del contenuto (concetti, strutture, dati rilevanti).
+2. **CONDENSATO**: sintesi in max 3 frasi dense (servirà come contesto per il frammento successivo).
+
+Formato obbligatorio:
+## ANALISI
+[testo]
+
+## CONDENSATO
+[max 3 frasi]"""
+
+CONDENSE_SYSTEM_PROMPT = """Estrai un condensato di massimo 3 frasi dall'analisi fornita.
+Solo il condensato, nessun'altra parola."""
+
+
+def _extract_condensed(analysis_text: str, *, llm_fn) -> str:
+    """Estrae il condensato dall'analisi completa. Prima prova il parsing, poi chiede all'LLM."""
+    # Tentativo parsing diretto dalla struttura ## CONDENSATO
+    if "## CONDENSATO" in analysis_text:
+        parts = analysis_text.split("## CONDENSATO", 1)
+        candidate = parts[1].strip().split("##")[0].strip()
+        if len(candidate) > 30:
+            return candidate
+
+    # Fallback: chiedi all'LLM di condensare
+    return llm_fn(
+        system_prompt=CONDENSE_SYSTEM_PROMPT,
+        user_message=analysis_text[:3000],
+        temperature=0.05,
+        max_tokens=200,
+    )
+
+
+def sliding_window_analyze(
+    *,
+    file_path: Path,
+    project_ingest_dir: Path,
+    llm_fn,                          # callable: llm_complete(system_prompt, user_message, ...) -> str
+    stop_event,                      # threading.Event — kill switch
+    log_fn=None,                     # callable(msg: str) per SSE alla UI
+    max_tokens_per_chunk: int = 1200,
+    overlap_chars: int = OVERLAP_CHARS,
+) -> FileIngestResult:
+    """
+    Processo completo per un singolo file:
+    1. Leggi e chunka con overlap
+    2. Salva struttura isolata in project_ingest_dir/<filename>/
+    3. Loop sliding window: analisi sequenziale con contesto condensato
+    4. Aggiorna analysis.md chunk per chunk
+    """
+    def log(msg: str) -> None:
+        logger.info(msg)
+        if log_fn:
+            log_fn(msg)
+
+    # ── 1. Lettura e chunking ─────────────────────────────────────────────
+    log(f"[INGEST] Lettura: {file_path.name}")
+    body = file_path.read_text(encoding="utf-8", errors="replace")
+
+    chunks, metas = _build_chunks_with_overlap(
+        body,
+        max_tokens=max_tokens_per_chunk,
+        overlap_chars=overlap_chars,
+    )
+    log(f"[INGEST] {len(chunks)} chunk (overlap {overlap_chars} char)")
+
+    # ── 2. Cartella isolata per questo file ──────────────────────────────
+    file_dir = project_ingest_dir / file_path.stem
+    file_dir.mkdir(parents=True, exist_ok=True)
+
+    # Copia file originale
+    import shutil
+    shutil.copy2(file_path, file_dir / f"original{file_path.suffix}")
+
+    # Salva testi chunk
+    for chunk in chunks:
+        chunk_path = file_dir / f"chunk_{chunk.index:03d}.txt"
+        chunk_path.write_text(chunk.text, encoding="utf-8", newline="\n")
+
+    # Salva mappa JSON
+    chunks_json = {
+        "source_file": file_path.name,
+        "total_chunks": len(chunks),
+        "chunk_strategy": "markdown_sections_overlap",
+        "overlap_chars": overlap_chars,
+        "chunks": [asdict(m) for m in metas],
+    }
+    atomic_write_json(file_dir / "chunks.json", chunks_json)
+    log(f"[INGEST] Struttura salvata: {file_dir}")
+
+    # ── 3. Sliding Window Analysis ───────────────────────────────────────
+    analysis_doc_path = file_dir / "analysis.md"
+    analyses: list[ChunkAnalysis] = []
+    prev_condensed: str = ""
+
+    for chunk in chunks:
+        if stop_event.is_set():
+            log(f"[STOP] Interrotto a chunk {chunk.index}/{len(chunks)}")
+            raise InterruptedError("Sliding window interrotto da Kill Switch")
+
+        log(f"[ANALYZE] Chunk {chunk.index + 1}/{len(chunks)}: {chunk.label}")
+
+        # Costruisce prompt con contesto condensato del chunk precedente
+        context_block = ""
+        if prev_condensed:
+            context_block = (
+                f"\n---\n**Contesto dal blocco precedente (condensato):**\n"
+                f"{prev_condensed}\n---\n\n"
+            )
+
+        user_msg = (
+            f"# Documento: `{file_path.name}`\n"
+            f"# Frammento {chunk.index + 1} di {len(chunks)}: `{chunk.label}`\n"
+            f"{context_block}"
+            f"## Testo del frammento\n\n{chunk.text}"
+        )
+
+        # Chiamata LLM
+        raw_analysis = llm_fn(
+            system_prompt=ANALYZE_SYSTEM_PROMPT,
+            user_message=user_msg,
+            temperature=0.07,
+            max_tokens=800,
+        )
+
+        # Estrazione condensato per il prossimo chunk
+        condensed = _extract_condensed(raw_analysis, llm_fn=llm_fn)
+        prev_condensed = condensed
+
+        analyses.append(ChunkAnalysis(
+            index=chunk.index,
+            label=chunk.label,
+            analysis=raw_analysis,
+            condensed=condensed,
+        ))
+
+        # ── Aggiorna analysis.md in append (chunk per chunk) ─────────────
+        section = (
+            f"\n\n---\n\n"
+            f"## Chunk {chunk.index + 1}/{len(chunks)}: {chunk.label}\n\n"
+            f"{raw_analysis.strip()}\n\n"
+            f"**[CONDENSATO per il prossimo chunk]:** {condensed}\n"
+        )
+        with analysis_doc_path.open("a", encoding="utf-8", newline="\n") as f:
+            if chunk.index == 0:
+                f.write(
+                    f"---\nsource: {file_path.name}\ngenerated_at: auto\n---\n\n"
+                    f"# Analisi sliding window: `{file_path.name}`\n\n"
+                    f"_Documento di tracciamento aggiornato chunk per chunk._\n"
+                )
+            f.write(section)
+
+        log(f"[ANALYZE] Chunk {chunk.index + 1} completato — condensato: {condensed[:80]}...")
+
+    log(f"[INGEST] File completato: {file_path.name} ({len(analyses)} chunk analizzati)")
+
+    return FileIngestResult(
+        source_file=str(file_path),
+        total_chunks=len(chunks),
+        analyses=analyses,
+        final_summary=analyses[-1].condensed if analyses else "",
+    )
+```
+
+---
+
+## Task 5 — Prompt per Cursor
+
+```
+# ISTRUZIONI PER CURSOR — Local AI Orchestrator Desktop
+
+## Contesto del progetto
+Stai lavorando su un repository Python esistente chiamato `local_ai_orchestrator`.
+Il codice attuale è un tool CLI per gap analysis documentale. Devi **evolvere** questo 
+progetto in un Orchestratore AI Desktop agnostico con UI, basandoti sul blueprint 
+architetturale sotto. Non cancellare il codice esistente: spostalo in `legacy/`.
+
+## Stack obbligatorio
+- **Backend:** Python 3.11+, Flask (SSE per log realtime), threading nativo
+- **UI:** PyWebView (wrapper HTML/CSS/JS in window nativa) — NON Electron, NON tkinter
+  - Se PyWebView non disponibile, Flask + apertura browser come fallback
+- **AI locali:** LM Studio (OpenAI-compatible :1234) + AnythingLLM (:3001)
+- **Dipendenze nuove:** pywebview>=5.0, flask>=3.0, flask-cors
+
+---
+
+## FASE 1 — Ristrutturazione directory (fai PRIMA di tutto)
+
+Crea questa struttura di cartelle. Sposta i file esistenti come indicato:
+
+```
+local_ai_orchestrator/
+├── app.py                    # NEW: Entry point (avvia PyWebView + Flask)
+├── server.py                 # NEW: Flask backend con tutti gli endpoint API
+├── engine/
+│   ├── __init__.py
+│   ├── orchestrator.py       # NEW: OrchestratorState + kill switch + thread pool
+│   ├── job_queue.py          # NEW: Coda job con priorità e cancellazione
+│   ├── ingest_processor.py   # NEW: Sliding window logic (vedi snippet sotto)
+│   ├── model_router.py       # NEW: Auto-discovery modelli + task routing
+│   ├── workflow_runner.py    # NEW: Plugin loader workflow
+│   └── cooldown_manager.py   # NEW: Pausa/cooldown configurabili
+├── workflows/
+│   ├── base_workflow.py      # NEW: ABC workflow
+│   └── gap_analysis.py       # MOVED+ADAPTED: logica da core/gap_runner.py
+├── projects/                 # Cartella runtime (gitignored) — creata a runtime
+├── core/                     # KEEP AS-IS: ai_tasks.py, chunking.py, token_budget.py,
+│                             #   context_budget.py, file_io.py, session_state.py, converters.py
+├── clients/
+│   ├── lm_studio.py          # MERGE: lm_studio_client.py + parti di core/ai_tasks.py
+│   └── anythingllm.py        # MOVED: anythingllm_client.py
+├── config/
+│   ├── hardware_profiles.py  # MOVED: config/hardware_profiles.py esistente
+│   ├── model_task_map.py     # NEW
+│   └── defaults.py           # NEW
+├── ui/
+│   ├── static/app.js         # NEW
+│   ├── static/style.css      # NEW
+│   └── templates/index.html  # NEW
+└── legacy/                   # MOVED: pipeline.py, local_doc_pipeline.py, orchestrator.py
+```
+
+---
+
+## FASE 2 — engine/orchestrator.py
+
+Implementa la classe `OrchestratorState` con queste caratteristiche ESATTE:
+
+```python
+class OrchestratorState:
+    stop_event: threading.Event       # set() per fermare tutto
+    active_http_clients: list         # httpx.Client registrati prima di ogni chiamata
+    job_queue: Queue                  # coda job in attesa
+    current_job: dict | None          # job in esecuzione
+    log_stream: Queue                 # messaggi SSE verso la UI
+    _lock: threading.Lock
+
+    def kill_all(self) -> None:
+        # 1. stop_event.set() — segnala a tutti i worker thread
+        # 2. for client in active_http_clients: client.close() — aborta HTTP in volo
+        # 3. svuota job_queue
+        # 4. log "STOP attivato" nel log_stream
+
+    def register_client(self, client) -> None: ...
+    def unregister_client(self, client) -> None: ...
+    def emit_log(self, msg: str, level: str = "INFO") -> None:
+        # Inserisce {"msg": msg, "level": level, "ts": utcnow} in log_stream
+```
+
+Crea un **singleton** accessibile da tutti i moduli via `get_state()`.
+
+Modifica `core/ai_tasks.llm_complete` per:
+1. Chiamare `get_state().stop_event.is_set()` prima di ogni richiesta HTTP
+2. Registrare/deregistrare il client httpx con `register_client`/`unregister_client`
+3. Emettere log via `get_state().emit_log(f"LLM call: {model} ~{tokens} tok")`
+
+---
+
+## FASE 3 — engine/ingest_processor.py (Sliding Window)
+
+Implementa la funzione `sliding_window_analyze` con questa firma e comportamento:
+
+```python
+def sliding_window_analyze(
+    file_path: Path,
+    file_dir: Path,           # projects/<slug>/01_INGEST/<filename>/
+    llm_fn: callable,         # llm_complete da core/ai_tasks
+    stop_event: threading.Event,
+    log_fn: callable,
+    max_tokens_per_chunk: int,
+    overlap_chars: int = 400,
+) -> FileIngestResult:
+```
+
+Logica OBBLIGATORIA:
+1. Leggi il file con `converters.extract_plain()`
+2. Chunka con `core/chunking.split_markdown_sections()` + aggiungi overlap fisico
+   (prendi gli ultimi `overlap_chars` caratteri del chunk precedente e
+   prefissali al chunk corrente con tag `[...contesto dal blocco precedente...]`)
+3. Salva in `file_dir/`:
+   - `original.<ext>` — copia del file sorgente
+   - `chunk_NNN.txt` — un file per ogni chunk (testo con overlap)
+   - `chunks.json` — mappa con index, label, char_start, char_end, token_estimate,
+     overlap_with_prev_chars, overlap_with_next_chars per ogni chunk
+   - `analysis.md` — creato vuoto, poi aggiornato in APPEND chunk per chunk
+4. Loop sequenziale per ogni chunk:
+   a. Se `stop_event.is_set()`: raise InterruptedError
+   b. Costruisci il prompt con: header file + contesto condensato del chunk precedente
+      (vuoto per il chunk 0) + testo del chunk corrente
+   c. Chiama `llm_fn` con `ANALYZE_SYSTEM_PROMPT` (analisi + condensato obbligatori)
+   d. Estrai il condensato dalla risposta (parsing `## CONDENSATO` o fallback LLM)
+   e. Salva il condensato come `prev_condensed` per il prossimo chunk
+   f. Append su `analysis.md`: sezione `## Chunk N/TOT: label`, analisi, condensato
+   g. `log_fn(f"Chunk {n+1}/{total} completato — {label}")`
+5. Ritorna `FileIngestResult` con lista `ChunkAnalysis`
+
+System prompt per l'analisi da usare (costante `ANALYZE_SYSTEM_PROMPT`):
+```
+Sei un analista documentale. Hai un frammento di documento con eventuale contesto.
+Produci:
+## ANALISI
+[descrizione dettagliata: concetti, strutture, dati, meccaniche rilevanti]
+## CONDENSATO
+[max 3 frasi dense — sarà il contesto per il frammento successivo]
+```
+
+---
+
+## FASE 4 — engine/model_router.py
+
+```python
+class ModelRouter:
+    # Al costruttore: GET /api/v1/models da LM Studio → popola self.available_models
+    
+    TASK_KEYWORDS = {
+        "reasoning": ["qwen", "deepseek", "mistral-nemo", "llama-3"],
+        "summary":   ["phi", "gemma", "llama-3.2"],
+        "fast":      ["phi", "smollm", "qwen2.5-3b"],
+    }
+    
+    def get_model_for_task(self, task_type: str) -> str:
+        # Cerca nei modelli disponibili quello che matcha meglio per task_type
+        # Fallback: primo modello non-VL, non-embedding disponibile
+    
+    def refresh(self) -> list[str]:
+        # Re-chiama GET /v1/models e aggiorna self.available_models
+```
+
+---
+
+## FASE 5 — engine/cooldown_manager.py
+
+```python
+class CooldownManager:
+    # Legge dal profilo HW attivo:
+    # - PIPELINE_LM_COOLDOWN_S: pausa dopo ogni risposta LLM
+    # - PIPELINE_CHUNK_COOLDOWN_S: pausa tra chunk
+    # - PIPELINE_FILE_PAUSE_S: pausa tra file
+    
+    def after_llm_call(self, stop_event) -> None:
+        # time.sleep(self.lm_cooldown) con check stop_event ogni 0.5s
+    
+    def after_chunk(self, stop_event) -> None: ...
+    def after_file(self, stop_event) -> None: ...
+```
+
+---
+
+## FASE 6 — server.py (Flask Backend)
+
+Implementa questi endpoint:
+
+```
+GET  /api/projects              → lista progetti in projects/
+POST /api/projects              → crea nuovo progetto (body: {name, workflow})
+GET  /api/projects/<slug>       → dettaglio progetto + file list con ruoli
+POST /api/projects/<slug>/roles → assegna ruolo a file {file_path: "SOT"|"Reference"|"Raw"}
+
+GET  /api/models                → lista modelli LM Studio disponibili
+GET  /api/profiles              → lista profili HW da config/hardware_profiles.py
+POST /api/profiles/select       → seleziona profilo attivo {profile_name: "eco"|"fast"|...}
+
+POST /api/jobs/start            → avvia pipeline su progetto {project: slug, workflow: nome}
+POST /api/jobs/stop             → chiama get_state().kill_all()
+GET  /api/jobs/status           → stato job corrente + stats file
+
+GET  /api/logs/stream           → SSE endpoint (Content-Type: text/event-stream)
+                                   emette da get_state().log_stream ogni 0.3s
+```
+
+Per i log SSE:
+```python
+@app.get("/api/logs/stream")
+def logs_stream():
+    def generate():
+        while True:
+            try:
+                msg = log_queue.get(timeout=0.3)
+                yield f"data: {json.dumps(msg)}\n\n"
+            except Empty:
+                yield "data: {\"heartbeat\": true}\n\n"
+    return Response(generate(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+```
+
+---
+
+## FASE 7 — ui/templates/index.html + static/app.js
+
+Layout a 3 colonne:
+- **Colonna sinistra:** Selezione Progetto (dropdown + nuovo), Workflow selector,
+  Profile selector (Eco / Fast / Deep), pulsante START verde, pulsante STOP rosso
+- **Colonna centrale:** File explorer del progetto con badge ruolo colorato
+  (SOT=blu, Reference=grigio, Raw=arancio) e click per assegnare ruolo
+- **Colonna destra:** Log stream realtime (scrolling automatico al fondo),
+  stats job (file completati / totali / failed), progress bar
+
+Funzionalità JS obbligatorie:
+1. SSE su `/api/logs/stream` → append in log panel con colori per level
+2. STOP button: POST /api/jobs/stop → disabilita START, abilita RESET
+3. File role assignment: click su file → modal dropdown (SOT / Reference / Raw) → POST /api/projects/<slug>/roles
+4. Auto-refresh file list ogni 5s durante job attivo
+
+---
+
+## FASE 8 — app.py (Entry Point)
+
+```python
+import threading
+import pywebview
+from server import app as flask_app
+
+def start_flask():
+    flask_app.run(port=7842, debug=False, use_reloader=False)
+
+if __name__ == "__main__":
+    t = threading.Thread(target=start_flask, daemon=True)
+    t.start()
+    import time; time.sleep(0.8)  # attendi Flask
+    webview.create_window(
+        "Local AI Orchestrator",
+        "http://localhost:7842",
+        width=1280, height=800,
+        min_size=(900, 600),
+    )
+    webview.start()
+```
+
+---
+
+## REGOLE GENERALI PER CURSOR
+
+1. **Non cancellare** `core/ai_tasks.py`, `core/chunking.py`, `core/token_budget.py` — usali as-is
+2. **Ogni modulo** deve importare `get_state()` da `engine/orchestrator.py` per i log e lo stop
+3. **Tutti i loop** che chiamano LLM devono controllare `stop_event.is_set()` prima di ogni iterazione
+4. **Il progetto attivo** è gestito tramite `projects/<slug>/project.json` — nessuna variabile globale
+5. **I path** nelle cartelle `projects/` sono sempre relativi al progetto — mai path assoluti hardcoded
+6. **`requirements.txt`** da aggiornare con: `pywebview>=5.0`, `flask>=3.0`, `flask-cors>=4.0`
+7. **Crea `projects/.gitkeep`** e aggiungi `projects/*/` a `.gitignore`
+8. **Non toccare** i file in `legacy/` — solo spostarli
+
+Inizia dalla FASE 1 (ristrutturazione directory) e confermami prima di procedere con la FASE 2.
+```
+
+---
+
+### Note operative per quando usi il prompt in Cursor
+
+Quando incolli il prompt, aggiungi in coda questa frase contestuale:
+
+> "Il repository di partenza è quello nella cartella corrente. I file `core/ai_tasks.py`, `core/chunking.py`, `core/session_state.py`, `core/file_io.py` e `converters.py` sono già funzionanti e testati — non riscriverli, solo importali dai nuovi moduli."
+
+**Ordine di lavoro consigliato con Cursor:**
+1. Fai girare solo Fase 1 (struttura) → verifica
+2. Fase 2 (orchestrator + kill switch) → testa con `python -c "from engine.orchestrator import get_state; get_state().emit_log('test')"`
+3. Fase 3 (sliding window) → testa su un singolo file `.md` prima di integrare la UI
+4. Fase 6+7 insieme (server + UI) → apri il browser su `localhost:7842` prima di passare a PyWebView
+5. Fase 8 (PyWebView) → solo quando tutto funziona nel browser

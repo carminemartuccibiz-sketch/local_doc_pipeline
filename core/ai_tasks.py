@@ -7,12 +7,14 @@ import logging
 import os
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any
+from typing import Any, Iterator
 
 import httpx
 
+from clients.http_helpers import lm_request
 from config import (
     LM_API_KEY,
     LM_MODEL,
@@ -41,6 +43,38 @@ from core.gap_prompts import (
     GAP_CONSOLIDATE_SYSTEM_PROMPT,
     GAP_INTEGRATE_SYSTEM_PROMPT,
 )
+
+
+def _orchestrator_state():
+    from engine.orchestrator import get_orchestrator_state
+
+    return get_orchestrator_state()
+
+
+def _check_kill_switch() -> None:
+    if _orchestrator_state().stop_event.is_set():
+        raise InterruptedError("Pipeline fermata dall'utente (Kill Switch)")
+
+
+@contextmanager
+def _managed_httpx_client(**kwargs: Any) -> Iterator[httpx.Client]:
+    """Client httpx registrato per kill switch (chiusura forzata in volo)."""
+    _check_kill_switch()
+    state = _orchestrator_state()
+    client = httpx.Client(**kwargs)
+    state.register_client(client)
+    try:
+        yield client
+    except httpx.HTTPError as e:
+        if state.stop_event.is_set():
+            raise InterruptedError("Richiesta annullata da Kill Switch") from e
+        raise
+    finally:
+        state.unregister_client(client)
+        try:
+            client.close()
+        except Exception:
+            pass
 
 
 class AIBackend(str, Enum):
@@ -122,8 +156,8 @@ def discover_lm_studio_model(
 
     # 1) API nativa LM Studio — campo loaded_instances
     try:
-        with httpx.Client(timeout=LM_TIMEOUT_S, headers=_auth_headers()) as client:
-            r = client.get(native_url)
+        with _managed_httpx_client(timeout=LM_TIMEOUT_S, headers=_auth_headers()) as client:
+            r = lm_request(client, "GET", native_url)
             if r.status_code == 200:
                 payload = r.json()
                 items = payload if isinstance(payload, list) else payload.get("models") or payload.get("data") or []
@@ -161,8 +195,8 @@ def discover_lm_studio_model(
 
     # 2) OpenAI-compatible GET /v1/models
     try:
-        with httpx.Client(timeout=LM_TIMEOUT_S, headers=_auth_headers()) as client:
-            r = client.get(models_url)
+        with _managed_httpx_client(timeout=LM_TIMEOUT_S, headers=_auth_headers()) as client:
+            r = lm_request(client, "GET", models_url)
             r.raise_for_status()
             data = r.json()
     except httpx.HTTPError as e:
@@ -218,14 +252,32 @@ def get_session_lm_model() -> str:
     return discover_lm_studio_model()
 
 
-def init_gap_analysis_session(*, require_allm: bool = True) -> str:
+def set_session_lm_model(model_id: str, *, persist_env: bool = True) -> str:
+    """Imposta modello per la sessione UI (dopo ModelRouter)."""
+    global _session_lm_model
+    mid = model_id.strip()
+    if not mid:
+        raise ValueError("model_id vuoto")
+    _session_lm_model = mid
+    if persist_env:
+        os.environ["LM_STUDIO_MODEL"] = mid
+    logger.info("Modello sessione: %s", mid)
+    return mid
+
+
+def init_gap_analysis_session(
+    *,
+    require_allm: bool = True,
+    force_refresh: bool = False,
+) -> str:
     """
     Pre-volo + auto-discovery modello. Da chiamare prima del loop su 01_RAW_INGEST.
+    Se il modello è già impostato (ModelRouter), non forzare refresh salvo richiesta.
     """
     from core.preflight import run_preflight_checks
 
     run_preflight_checks(require_lm=True, require_allm=require_allm)
-    model = discover_lm_studio_model(force_refresh=True)
+    model = discover_lm_studio_model(force_refresh=force_refresh)
     print(f"  Modello LM Studio per questa sessione: {model}")
     return model
 
@@ -256,8 +308,8 @@ def _complete_openai_compatible(
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
-    with httpx.Client(timeout=LM_TIMEOUT_S, headers=_auth_headers()) as client:
-        r = client.post(url, json=payload)
+    with _managed_httpx_client(timeout=LM_TIMEOUT_S, headers=_auth_headers()) as client:
+        r = lm_request(client, "POST", url, json=payload)
         r.raise_for_status()
         data = r.json()
     return data["choices"][0]["message"]["content"].strip()
@@ -280,8 +332,8 @@ def _complete_ollama(
         "stream": False,
         "options": {"temperature": temperature},
     }
-    with httpx.Client(timeout=LM_TIMEOUT_S) as client:
-        r = client.post(f"{base}/api/chat", json=payload)
+    with _managed_httpx_client(timeout=LM_TIMEOUT_S) as client:
+        r = lm_request(client, "POST", f"{base}/api/chat", json=payload)
         r.raise_for_status()
         return r.json()["message"]["content"].strip()
 
@@ -315,8 +367,8 @@ def _complete_lm_native(system_prompt: str, user_message: str, temperature: floa
         "temperature": temperature,
         "context_length": ctx,
     }
-    with httpx.Client(timeout=LM_TIMEOUT_S, headers=_auth_headers()) as client:
-        r = client.post(LM_NATIVE_CHAT_URL, json=payload)
+    with _managed_httpx_client(timeout=LM_TIMEOUT_S, headers=_auth_headers()) as client:
+        r = lm_request(client, "POST", LM_NATIVE_CHAT_URL, json=payload)
         r.raise_for_status()
         data = r.json()
     text = parse_lm_native_response(data)
@@ -341,8 +393,9 @@ def llm_complete(
             temperature=temperature,
             max_tokens=max_tokens,
         )
-    if PIPELINE_LM_COOLDOWN_S > 0:
-        time.sleep(PIPELINE_LM_COOLDOWN_S)
+    from engine.cooldown_manager import get_cooldown_manager
+
+    get_cooldown_manager().after_llm_call(_orchestrator_state().stop_event)
     return result
 
 
@@ -353,9 +406,18 @@ def _llm_complete_unlocked(
     temperature: float = 0.1,
     max_tokens: int = 4096,
 ) -> str:
+    _check_kill_switch()
     backend = _backend()
     if backend == AIBackend.OLLAMA:
         model = os.environ.get("OLLAMA_MODEL", "llama3.2")
+    elif backend == AIBackend.OPENAI:
+        model = os.environ.get("OPENAI_MODEL", "") or get_session_lm_model()
+    else:
+        model = get_session_lm_model()
+    est_tok = count_tokens(system_prompt + user_message, model_hint=model)
+    _orchestrator_state().emit_log(f"LLM call: {model} ~{est_tok} tok")
+
+    if backend == AIBackend.OLLAMA:
         return _complete_ollama(
             model=model,
             system_prompt=system_prompt,
@@ -364,7 +426,6 @@ def _llm_complete_unlocked(
         )
     if backend == AIBackend.OPENAI:
         base = os.environ.get("OPENAI_BASE_URL", LM_OPENAI_BASE_URL)
-        model = os.environ.get("OPENAI_MODEL", "") or get_session_lm_model()
         return _complete_openai_compatible(
             base_url=base,
             model=model,
@@ -374,7 +435,6 @@ def _llm_complete_unlocked(
             max_tokens=max_tokens,
         )
     # lm_studio default
-    model = get_session_lm_model()
     safe_max = min(
         max_tokens,
         int(os.environ.get("GAP_LM_MAX_OUTPUT", "2048")),

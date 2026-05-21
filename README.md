@@ -1,6 +1,34 @@
-# DVAMOCLES — `local_doc_pipeline`
+# Local AI Orchestrator (`local_doc_pipeline`)
 
-Software Python per **DVAMOCLES SWORD™: Material Forge Studio®** — pipeline documentale locale, fault-tolerant, pensata per modelli on-prem (contesto 8k–16k).
+Software Python per **DVAMOCLES SWORD™** — orchestratore desktop (Flask UI + ingest sliding window) e pipeline gap analysis legacy.
+
+## Avvio rapido (UI)
+
+```powershell
+.\dvamocles_daemon.ps1    # browser → http://127.0.0.1:7842
+# oppure finestra nativa:
+python app.py
+```
+
+CLI legacy: `python legacy/cli.py check` · `python legacy/cli.py run`
+
+---
+
+## Documentazione e blueprint
+
+| Risorsa | Descrizione |
+|---------|-------------|
+| [`docs/guides/README.md`](docs/guides/README.md) | Indice guide (blueprint Cursor + handoff DVAMOCLES) |
+| [`docs/guides/claude-commands-dir/claude commands`](docs/guides/claude-commands-dir/claude%20commands) | Blueprint Local AI Orchestrator (Task 1–8) |
+| [`docs/BLUEPRINT_VALIDATION.md`](docs/BLUEPRINT_VALIDATION.md) | Confronto blueprint ↔ codice (✅ / ⚠️ / ❌) |
+
+Documentazione storica e profili HW: resto di [`docs/`](docs/).
+
+---
+
+# DVAMOCLES — pipeline documentale
+
+Pipeline documentale locale, fault-tolerant, pensata per modelli on-prem (contesto 8k–16k).
 
 **Repository Git dedicato** al software. Il corpus documentale vive nel repo sorella  
 `DVAMOCLES-SWORD-AMBIENT-FULL-DOCUMENTATION` (stessa macchina, path in `DVAMOCLES_SOURCE_ROOT` nel `.env`).
@@ -13,16 +41,18 @@ Il repo documentazione contiene anni di materiali (chat AI, Takeout NotebookLM, 
 
 Questa pipeline **non** riscrive né fonde automaticamente i materiali grezzi nella SOT. Il suo compito è:
 
-1. **Raccogliere** in modo sicuro i file sparsi in `01_RAW_INGEST/` (copia, deduplica MD5).
+1. **Raccogliere** in modo sicuro i file sparsi in `data/01_RAW_INGEST/` (copia, deduplica MD5).
 2. **Confrontare** ogni documento grezzo con la SOT e produrre un **Gap Report** (mancanze e contraddizioni, non riassunti).
-3. **Riprendere** dopo interruzioni (Ctrl+C, crash) grazie a `02_SESSION_MEMORY/pipeline_state.json`.
+3. **Riprendere** dopo interruzioni (Ctrl+C, crash) grazie a `data/02_SESSION_MEMORY/pipeline_state.json`.
 4. **Rispettare** i limiti di contesto dei LLM locali (chunking, RAG AnythingLLM, budget token).
 
-Output gap: `02_SESSION_MEMORY/GAP_ANALYSIS_REPORTS/` (`GAP_<file>.md` + `Gap_Report_Generale.md`).
+Output gap: `data/02_SESSION_MEMORY/GAP_ANALYSIS_REPORTS/` (`GAP_<file>.md` + `Gap_Report_Generale.md`).
 
-Un flusso separato (`pipeline.py`) può estrarre testi verso `Dvamocles_Pre_Claude_Refactor/` per refactor successivo con Claude; il percorso **principale operativo oggi** è **Gap Analysis** via `orchestrator.py` / `cli.py run`.
+Progetti UI: `projects/<slug>/` (ingest sliding window in `01_INGEST/`).
 
-**Validazione esterna (Claude):** allega solo questa cartella — vedi [`EXPORT_FOR_CLAUDE_VALIDATION.md`](EXPORT_FOR_CLAUDE_VALIDATION.md) e il prompt pronto in [`PROMPT_FOR_CLAUDE_ANALYSIS.md`](PROMPT_FOR_CLAUDE_ANALYSIS.md).
+Flusso legacy: `legacy/pipeline.py`, `legacy/orchestrator_v1.py`, `legacy/cli.py`.
+
+**Validazione esterna (Claude):** vedi [`docs/EXPORT_FOR_CLAUDE_VALIDATION.md`](docs/EXPORT_FOR_CLAUDE_VALIDATION.md).
 
 ---
 

@@ -10,16 +10,25 @@ import os
 from pathlib import Path
 from typing import Any
 
-from anythingllm_client import AnythingLLMClient, AnythingLLMError
+from clients.anythingllm import AnythingLLMClient, AnythingLLMError
 from config import GAP_RAG_TOP_N, GAP_USE_ALLM_RAG, PIPELINE_ROOT
 from core.file_io import atomic_write_json
 from core.paths import session_memory_dir
 from core.progress import progress_bar
-from settings import ALLM_SOT_WORKSPACE_NAME, ALLM_SOT_WORKSPACE_SLUG
+from config import ALLM_SOT_WORKSPACE_NAME, ALLM_SOT_WORKSPACE_SLUG
 
 logger = logging.getLogger(__name__)
 
-_LEGACY_STATE = PIPELINE_ROOT / "gap_allm_state.json"
+_LEGACY_STATE = session_memory_dir() / "gap_allm_state.json"
+
+_memory_dir_override: Path | None = None
+
+
+def set_gap_allm_memory_dir(path: Path | None) -> None:
+    """UI progetto: state sotto projects/<slug>/04_MEMORY/."""
+    global _memory_dir_override
+    _memory_dir_override = path
+
 
 # manual = nessuna chiamata API embed (incorpora dall'UI AnythingLLM — consigliato)
 # per_file = un documento per richiesta update-embeddings (timeout lungo)
@@ -29,7 +38,9 @@ def _embed_mode() -> str:
 
 
 def gap_allm_state_path() -> Path:
-    return session_memory_dir() / "gap_allm_state.json"
+    base = _memory_dir_override or session_memory_dir()
+    base.mkdir(parents=True, exist_ok=True)
+    return base / "gap_allm_state.json"
 
 
 def _file_md5(path: Path) -> str:

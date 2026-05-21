@@ -16,10 +16,10 @@ import logging
 import sys
 from pathlib import Path
 
-from anythingllm_client import AnythingLLMClient, AnythingLLMError
+from clients.anythingllm import AnythingLLMClient, AnythingLLMError
 from config import DEFAULT_SOURCE_ROOT
-from lm_studio_client import LMStudioClient, LMStudioError
-from pipeline import run_pipeline
+from clients.lm_studio import LMStudioClient, LMStudioError
+from legacy.pipeline import run_pipeline
 
 
 def setup_logging(verbose: bool) -> None:

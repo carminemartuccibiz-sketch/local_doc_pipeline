@@ -8,8 +8,14 @@ import re
 from pathlib import Path
 from typing import Iterator
 
-from config import ACCEPTED_EXTENSIONS, DEFAULT_SOURCE_ROOT, PIPELINE_ROOT, SOT_TIERS
-from settings import GAP_SOT_LAST_DOCS_ONLY
+from config import (
+    ACCEPTED_EXTENSIONS,
+    DATA_ROOT,
+    DEFAULT_SOURCE_ROOT,
+    PIPELINE_ROOT,
+    SOT_TIERS,
+    GAP_SOT_LAST_DOCS_ONLY,
+)
 
 DIR_RAW_INGEST = "01_RAW_INGEST"
 DIR_SESSION_MEMORY = "02_SESSION_MEMORY"
@@ -26,11 +32,11 @@ def workspace_root(repo_root: Path | None = None) -> Path:
 
 
 def raw_ingest_dir(repo_root: Path | None = None) -> Path:
-    return workspace_root(repo_root) / DIR_RAW_INGEST
+    return DATA_ROOT / DIR_RAW_INGEST
 
 
 def gap_reports_dir(repo_root: Path | None = None) -> Path:
-    return workspace_root(repo_root) / DIR_SESSION_MEMORY / DIR_GAP_REPORTS
+    return DATA_ROOT / DIR_SESSION_MEMORY / DIR_GAP_REPORTS
 
 
 def gap_report_path(
@@ -52,7 +58,7 @@ def gap_report_path_for_raw(raw_rel: str, repo_root: Path | None = None) -> Path
 
 
 def session_memory_dir(repo_root: Path | None = None) -> Path:
-    return workspace_root(repo_root) / DIR_SESSION_MEMORY
+    return DATA_ROOT / DIR_SESSION_MEMORY
 
 
 def session_state_path(repo_root: Path | None = None) -> Path:

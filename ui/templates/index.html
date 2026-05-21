@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Local AI Orchestrator</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="header">
+    <h1 class="title">Orchestrator</h1>
+    <div class="header-meta">
+      <span id="model-badge" class="pill">Modello —</span>
+      <span id="job-badge" class="pill">Idle</span>
+    </div>
+  </header>
+
+  <main class="grid">
+    <aside class="sidebar">
+      <section class="block">
+        <label class="label" for="project-select">Progetto</label>
+        <select id="project-select"></select>
+        <div class="inline">
+          <input type="text" id="new-project-name" placeholder="Nuovo nome" />
+          <button type="button" id="btn-new-project" class="btn ghost">+</button>
+        </div>
+      </section>
+
+      <section class="block">
+        <label class="label" for="workflow-select">Workflow</label>
+        <select id="workflow-select"></select>
+      </section>
+
+      <section class="block">
+        <label class="label" for="profile-select">Profilo</label>
+        <select id="profile-select">
+          <option value="eco">Eco</option>
+          <option value="fast">Fast</option>
+          <option value="deep">Deep</option>
+        </select>
+      </section>
+
+      <section class="block actions">
+        <button type="button" id="btn-start" class="btn primary">Start</button>
+        <button type="button" id="btn-stop" class="btn danger" disabled>Stop</button>
+        <button type="button" id="btn-reset" class="btn ghost" disabled>Reset</button>
+      </section>
+    </aside>
+
+    <section class="main-pane">
+      <div class="pane-head">
+        <h2 class="pane-title">File</h2>
+        <span id="project-slug-label" class="caption"></span>
+      </div>
+      <ul id="file-list" class="file-list"></ul>
+    </section>
+
+    <aside class="inspector">
+      <section class="block">
+        <h2 class="pane-title">Progress</h2>
+        <div class="metrics">
+          <div><span class="metric-val" id="stat-done">0</span><span class="metric-lbl">done</span></div>
+          <div><span class="metric-val" id="stat-total">0</span><span class="metric-lbl">total</span></div>
+          <div><span class="metric-val" id="stat-failed">0</span><span class="metric-lbl">failed</span></div>
+        </div>
+        <div class="progress-track"><div id="progress-bar" class="progress-fill"></div></div>
+        <p id="current-file" class="caption"></p>
+      </section>
+      <section class="block log-block">
+        <h2 class="pane-title">Log</h2>
+        <div id="log-stream" class="log" role="log"></div>
+      </section>
+    </aside>
+  </main>
+
+  <div id="role-modal" class="modal hidden" role="dialog" aria-modal="true">
+    <div class="sheet">
+      <h3 class="sheet-title">Ruolo file</h3>
+      <p id="role-modal-path" class="caption"></p>
+      <select id="role-modal-select" class="select-full">
+        <option value="SOT">SOT</option>
+        <option value="Reference">Reference</option>
+        <option value="Raw">Raw</option>
+      </select>
+      <div class="sheet-actions">
+        <button type="button" id="role-modal-cancel" class="btn ghost">Annulla</button>
+        <button type="button" id="role-modal-save" class="btn primary">Salva</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-from anythingllm_client import AnythingLLMClient, AnythingLLMError
+from clients.anythingllm import AnythingLLMClient, AnythingLLMError
 from config import (
     ACCEPTED_EXTENSIONS,
     DEFAULT_SOURCE_ROOT,
@@ -25,9 +25,9 @@ from config import (
     ensure_pipeline_dirs,
     output_dir,
 )
-from converters import ConvertResult, convert_file
+from core.converters import ConvertResult, convert_file
 from core.file_io import atomic_write_json
-from lm_studio_client import (
+from clients.lm_studio import (
     EXTRACTOR_SYSTEM_PROMPT,
     LMStudioClient,
     LMStudioError,

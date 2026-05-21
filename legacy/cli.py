@@ -67,7 +67,7 @@ def cmd_check() -> int:
 
     if allm_ok and ANYTHINGLLM_API_KEY:
         try:
-            from anythingllm_client import AnythingLLMClient
+            from clients.anythingllm import AnythingLLMClient
 
             ws = AnythingLLMClient().list_workspaces()
             print(f"  Workspaces:      {len(ws)}")
@@ -102,7 +102,7 @@ def cmd_init_ingest(args: argparse.Namespace) -> int:
 
 
 def cmd_pipeline(args: argparse.Namespace) -> int:
-    from pipeline import run_pipeline
+    from legacy.pipeline import run_pipeline
 
     include = list(args.include or [])
     if args.priority_only:
@@ -148,7 +148,7 @@ def cmd_reset_gap(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    from orchestrator import run_autonomous_pipeline
+    from legacy.orchestrator_v1 import run_autonomous_pipeline
 
     return run_autonomous_pipeline(
         repo_root=args.source_root.resolve(),
@@ -309,7 +309,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--skip-ingest", action="store_true")
     run.add_argument("--skip-preflight", action="store_true")
     run.add_argument("--dry-run-ingest", action="store_true")
-    from settings import GAP_BATCH_SIZE
+    from config import GAP_BATCH_SIZE
 
     run.add_argument(
         "--limit",

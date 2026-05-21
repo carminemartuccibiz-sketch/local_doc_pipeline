@@ -15,7 +15,7 @@ from core.ingest_copy import populate_raw_ingest
 from core.paths import raw_ingest_dir, session_state_path
 from core.preflight import LocalAIPreflightError, run_preflight_checks
 from core.session_state import PipelineSessionState
-from settings import GAP_BATCH_SIZE
+from config import GAP_BATCH_SIZE
 
 
 def setup_logging(verbose: bool) -> None:

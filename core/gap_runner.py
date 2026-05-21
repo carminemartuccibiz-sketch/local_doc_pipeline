@@ -16,7 +16,7 @@ from config import (
     PIPELINE_HARDWARE_PROFILE,
     PIPELINE_MAX_CONCURRENCY,
 )
-from converters import extract_plain
+from core.converters import extract_plain
 from core.ai_tasks import (
     GAP_INTEGRATE_SYSTEM_PROMPT,
     _format_session_block,
@@ -42,7 +42,7 @@ from core.paths import (
     raw_ingest_dir,
     sot_tier_labels,
 )
-from settings import GAP_BATCH_SIZE, GAP_SOT_LAST_DOCS_ONLY
+from config import GAP_BATCH_SIZE, GAP_SOT_LAST_DOCS_ONLY
 from core.preflight import LocalAIPreflightError
 from core.progress import progress_bar
 from core.session_state import PipelineSessionState
@@ -395,18 +395,19 @@ def open_gap_pipeline(
     skip_allm: bool = False,
     force_allm_sync: bool = False,
     state: PipelineSessionState | None = None,
+    cumulative: Path | None = None,
 ) -> GapPipelineContext | None:
     """Inizializza sessione gap (preflight, SOT, AnythingLLM). Ritorna None se server non pronti."""
     ensure_session_dirs(repo_root)
     ingest = ingest_root or raw_ingest_dir(repo_root)
-    cumulative = gap_report_path(repo_root)
+    cumulative = cumulative or gap_report_path(repo_root)
     st = state or PipelineSessionState()
     st.begin_pipeline("gap_analysis")
 
     sot_dirs = sot_paths or default_sot_directories(repo_root)
     require_allm = GAP_USE_ALLM_RAG and not skip_allm
     try:
-        init_gap_analysis_session(require_allm=require_allm)
+        init_gap_analysis_session(require_allm=require_allm, force_refresh=False)
     except LocalAIPreflightError:
         return None
 
