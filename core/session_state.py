@@ -187,7 +187,31 @@ class PipelineSessionState:
     def resume_chunk_index(self, rel_key: str) -> int:
         if self.file_status(rel_key) != "processing":
             return 0
-        return int(self.data.get("current_chunk") or 0)
+        entry = self.data.get("files", {}).get(rel_key, {})
+        return int(entry.get("chunks_done") or 0)
+
+    def prune_completed(self, *, keep_last_n: int = 200) -> int:
+        """Riduce pipeline_state.json rimuovendo entry completed in eccesso."""
+        files = self.data.setdefault("files", {})
+        completed_keys = [
+            k for k, e in files.items() if e.get("status") == "completed"
+        ]
+        if len(completed_keys) <= keep_last_n:
+            return 0
+        completed_keys.sort(
+            key=lambda k: files[k].get("updated_at") or "",
+        )
+        to_remove = completed_keys[: len(completed_keys) - keep_last_n]
+        for k in to_remove:
+            del files[k]
+        self._dirty = True
+        self.save(force=True)
+        logger.info(
+            "State: rimossi %d file completed (mantenuti ultimi %d)",
+            len(to_remove),
+            keep_last_n,
+        )
+        return len(to_remove)
 
     def interrupted_file(self) -> str | None:
         cf = self.data.get("current_file")
@@ -233,3 +257,7 @@ class PipelineSessionState:
             "processing": sum(1 for e in files.values() if e.get("status") == "processing"),
             "failed": sum(1 for e in files.values() if e.get("status") == "failed"),
         }
+
+    def work_remaining(self, ordered_keys: list[str]) -> int:
+        """File ancora da processare (pending, processing, failed)."""
+        return len(self.pending_or_resume_files(ordered_keys))

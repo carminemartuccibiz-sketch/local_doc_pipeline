@@ -50,11 +50,9 @@ def _headers() -> dict[str, str]:
 
 
 def _parse_native_response(data: dict[str, Any]) -> str:
-    parts: list[str] = []
-    for block in data.get("output") or []:
-        if isinstance(block, dict) and block.get("type") == "message":
-            parts.append(str(block.get("content") or ""))
-    return "\n".join(parts).strip()
+    from core.ai_tasks import parse_lm_native_response
+
+    return parse_lm_native_response(data)
 
 
 class LMStudioClient:
@@ -99,80 +97,19 @@ class LMStudioClient:
         temperature: float = 0.15,
         max_tokens: int = 8192,
     ) -> str:
-        if self.use_native:
-            return self._complete_native(
-                user_message=user_message,
-                system_prompt=system_prompt,
-                temperature=temperature,
-            )
-        return self._complete_openai(
-            user_message=user_message,
-            system_prompt=system_prompt,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
+        from core.ai_tasks import llm_complete
 
-    def _complete_openai(
-        self,
-        *,
-        user_message: str,
-        system_prompt: str,
-        temperature: float,
-        max_tokens: int,
-    ) -> str:
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message},
-            ],
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        }
-        url = f"{LM_OPENAI_BASE_URL}/chat/completions"
-        with httpx.Client(timeout=LM_TIMEOUT_S, headers=_headers()) as c:
-            try:
-                r = c.post(url, json=payload)
-            except httpx.RequestError as e:
-                raise LMStudioError(
-                    f"LM Studio non raggiungibile su {url}. Avvia server in LM Studio. ({e})"
-                ) from e
-            if r.status_code >= 400:
-                # fallback native se completions non supportato
-                logger.warning("OpenAI completions HTTP %s — retry native chat", r.status_code)
-                return self._complete_native(
-                    user_message=user_message,
-                    system_prompt=system_prompt,
-                    temperature=temperature,
-                )
-            data = r.json()
         try:
-            return data["choices"][0]["message"]["content"].strip()
-        except (KeyError, IndexError, TypeError) as e:
-            raise LMStudioError(f"Risposta LM Studio inattesa: {data!r}") from e
-
-    def _complete_native(
-        self,
-        *,
-        user_message: str,
-        system_prompt: str,
-        temperature: float,
-    ) -> str:
-        payload = {
-            "model": self.model,
-            "system_prompt": system_prompt,
-            "input": user_message,
-            "temperature": temperature,
-            "context_length": 32768,
-        }
-        with httpx.Client(timeout=LM_TIMEOUT_S, headers=_headers()) as c:
-            try:
-                r = c.post(LM_NATIVE_CHAT_URL, json=payload)
-            except httpx.RequestError as e:
-                raise LMStudioError(f"Native chat non raggiungibile: {e}") from e
-            if r.status_code >= 400:
-                raise LMStudioError(f"Native chat HTTP {r.status_code}: {r.text[:400]}")
-            return _parse_native_response(r.json())
+            return llm_complete(
+                system_prompt=system_prompt,
+                user_message=user_message,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+        except RuntimeError as e:
+            raise LMStudioError(str(e)) from e
+        except httpx.HTTPError as e:
+            raise LMStudioError(f"LM Studio request failed: {e}") from e
 
 
 def build_user_prompt(

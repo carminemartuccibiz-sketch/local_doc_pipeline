@@ -7,6 +7,7 @@
 .staging_md/
 logs/
 gap_allm_state.json
+02_SESSION_MEMORY/gap_allm_state.json
 pipeline_state.json
 pipeline_state.json.tmp
 ingest_manifest.json

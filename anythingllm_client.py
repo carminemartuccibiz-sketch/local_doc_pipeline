@@ -4,6 +4,8 @@ Client REST AnythingLLM — workspace, upload, embeddings, vector-search.
 from __future__ import annotations
 
 import logging
+import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +50,78 @@ class AnythingLLMClient:
                 return r.status_code == 200
         except httpx.RequestError:
             return False
+
+    def get_workspace(self, slug: str) -> dict[str, Any]:
+        with httpx.Client(timeout=self.timeout, headers=self._headers) as c:
+            r = c.get(self._url(f"/v1/workspace/{slug}"))
+            if r.status_code == 404:
+                return {}
+            r.raise_for_status()
+            data = r.json()
+        return dict(data.get("workspace") or data or {})
+
+    def list_workspace_document_keys(self, workspace_slug: str) -> set[str]:
+        """
+        Chiavi documento già nel workspace (title / docSource / filename / docpath).
+        Best-effort: dipende dalla versione AnythingLLM.
+        """
+        keys: set[str] = set()
+        ws = self.get_workspace(workspace_slug)
+
+        def _add(val: Any) -> None:
+            if not val:
+                return
+            s = str(val).replace("\\", "/")
+            keys.add(s)
+            keys.add(Path(s).name)
+
+        for bucket in (
+            ws.get("documents"),
+            ws.get("files"),
+            ws.get("workspaceDocuments"),
+        ):
+            if not isinstance(bucket, list):
+                continue
+            for doc in bucket:
+                if not isinstance(doc, dict):
+                    continue
+                for field in (
+                    "docSource",
+                    "title",
+                    "filename",
+                    "name",
+                    "originalFilename",
+                    "docpath",
+                    "location",
+                ):
+                    _add(doc.get(field))
+                meta = doc.get("metadata")
+                if isinstance(meta, dict):
+                    for field in ("docSource", "title", "filename"):
+                        _add(meta.get(field))
+
+        # Alcune build annidano documenti in sotto-oggetti
+        def _walk(obj: Any, depth: int = 0) -> None:
+            if depth > 6:
+                return
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    if k in (
+                        "docSource",
+                        "title",
+                        "filename",
+                        "name",
+                        "docpath",
+                        "location",
+                    ):
+                        _add(v)
+                    _walk(v, depth + 1)
+            elif isinstance(obj, list):
+                for item in obj:
+                    _walk(item, depth + 1)
+
+        _walk(ws)
+        return keys
 
     def list_workspaces(self) -> list[dict[str, Any]]:
         with httpx.Client(timeout=self.timeout, headers=self._headers) as c:
@@ -135,7 +209,13 @@ class AnythingLLMClient:
         *,
         adds: list[str] | None = None,
         deletes: list[str] | None = None,
+        timeout_s: float | None = None,
+        retries: int = 1,
     ) -> None:
+        """
+        Incorpora documenti nel vector DB del workspace.
+        L'operazione può richiedere minuti: usare timeout_s alto (es. 600–900).
+        """
         payload: dict[str, list[str]] = {}
         if adds:
             payload["adds"] = adds
@@ -143,12 +223,56 @@ class AnythingLLMClient:
             payload["deletes"] = deletes
         if not payload:
             return
-        with httpx.Client(timeout=self.timeout, headers=self._headers) as c:
-            r = c.post(
-                self._url(f"/v1/workspace/{workspace_slug}/update-embeddings"),
-                json=payload,
-            )
-            r.raise_for_status()
+
+        t = timeout_s or float(os.environ.get("ALLM_EMBED_TIMEOUT_S", "600"))
+        url = self._url(f"/v1/workspace/{workspace_slug}/update-embeddings")
+        last_err: Exception | None = None
+
+        for attempt in range(1, max(1, retries) + 1):
+            try:
+                logger.info(
+                    "AnythingLLM update-embeddings (%d doc, timeout %.0fs, tentativo %d)",
+                    len(adds or []),
+                    t,
+                    attempt,
+                )
+                with httpx.Client(timeout=t, headers=self._headers) as c:
+                    r = c.post(url, json=payload)
+                if r.status_code >= 400:
+                    raise AnythingLLMError(
+                        f"update-embeddings HTTP {r.status_code}: {r.text[:500]}"
+                    )
+                return
+            except (httpx.TimeoutException, httpx.ReadTimeout) as e:
+                last_err = e
+                logger.warning(
+                    "Embedding timeout (%.0fs) — AnythingLLM potrebbe comunque "
+                    "completare in background nell'UI",
+                    t,
+                )
+                if attempt < retries:
+                    time.sleep(5.0)
+            except httpx.HTTPError as e:
+                last_err = e
+                if attempt < retries:
+                    time.sleep(3.0)
+                else:
+                    raise AnythingLLMError(f"update-embeddings fallito: {e}") from e
+
+        if last_err:
+            raise AnythingLLMError(
+                f"update-embeddings timeout dopo {retries} tentativi "
+                f"(timeout={t:.0f}s). Usa ALLM_EMBED_MODE=manual e incorpora dall'UI."
+            ) from last_err
+
+    def probe_vector_search(
+        self,
+        workspace_slug: str,
+        query: str = "DVAMOCLES LAST DOCS Material Forge",
+    ) -> bool:
+        """True se il workspace risponde a vector-search (embedding pronti)."""
+        hits = self.vector_search(workspace_slug, query, top_n=1, score_threshold=0.0)
+        return bool(hits)
 
     def vector_search(
         self,

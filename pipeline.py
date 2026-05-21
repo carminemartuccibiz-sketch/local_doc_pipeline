@@ -26,6 +26,7 @@ from config import (
     output_dir,
 )
 from converters import ConvertResult, convert_file
+from core.file_io import atomic_write_json
 from lm_studio_client import (
     EXTRACTOR_SYSTEM_PROMPT,
     LMStudioClient,
@@ -51,7 +52,7 @@ class PipelineState:
 
     def save(self, path: Path = STATE_FILE) -> None:
         self.updated_at = datetime.now(UTC).isoformat()
-        path.write_text(json.dumps(asdict(self), indent=2, ensure_ascii=False), encoding="utf-8")
+        atomic_write_json(path, asdict(self))
 
     @classmethod
     def load(cls, path: Path = STATE_FILE) -> PipelineState:

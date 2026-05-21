@@ -34,7 +34,19 @@ def cmd_check() -> int:
     from core.ai_tasks import discover_lm_studio_model
     from core.preflight import LocalAIPreflightError, ping_anythingllm, ping_lm_studio
 
+    from config import (
+        GAP_BATCH_SIZE,
+        PIPELINE_HARDWARE_PROFILE,
+        PIPELINE_MAX_CONCURRENCY,
+    )
+
     print("Pre-volo endpoint locali DVAMOCLES:\n")
+    prof = PIPELINE_HARDWARE_PROFILE or "(non impostato)"
+    print(
+        f"  Profilo HW:        {prof}\n"
+        f"  Concorrenza LLM:   {PIPELINE_MAX_CONCURRENCY}\n"
+        f"  File per run:      {GAP_BATCH_SIZE}\n"
+    )
     print(f"  LM Studio API:     {LM_OPENAI_BASE_URL}")
     print(f"  AnythingLLM API:   {ANYTHINGLLM_API_V1_URL}\n")
 
@@ -114,6 +126,27 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_reset_gap(args: argparse.Namespace) -> int:
+    from core.reset_session import reset_gap_session
+
+    repo = args.source_root.resolve()
+    print("Reset sessione gap analysis:\n")
+    for line in reset_gap_session(
+        repo,
+        requeue_all_pending=not args.wipe_state,
+        keep_allm_cache=args.keep_allm_cache,
+    ):
+        print(f"  • {line}")
+    print(
+        "\nProssimo passo:\n"
+        "  1. Se hai già «Salva e incorpora» in AnythingLLM: usa reset-gap --keep-allm-cache\n"
+        "  2. In AnythingLLM: workspace SOT → elimina duplicati se hai rifatto upload API\n"
+        "  3. LM Studio: Stop Server → ricarica modello → Start Server\n"
+        "  4. .\\start_dvamocles_pipeline.ps1 -Limit 3   (test breve)\n"
+    )
+    return 0
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     from orchestrator import run_autonomous_pipeline
 
@@ -127,6 +160,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         skip_allm=args.skip_allm,
         force_allm_sync=args.force_allm_sync,
         reset_state=args.reset_state,
+        continuous=getattr(args, "continuous", False),
+        max_rounds=getattr(args, "max_rounds", None),
     )
 
 
@@ -274,11 +309,40 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--skip-ingest", action="store_true")
     run.add_argument("--skip-preflight", action="store_true")
     run.add_argument("--dry-run-ingest", action="store_true")
-    run.add_argument("--limit", type=int, default=None)
+    from settings import GAP_BATCH_SIZE
+
+    run.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help=f"Max file grezzi per run (default {GAP_BATCH_SIZE}, come orchestrator)",
+    )
     run.add_argument("--append-only", action="store_true")
     run.add_argument("--skip-allm", action="store_true")
     run.add_argument("--force-allm-sync", action="store_true")
     run.add_argument("--reset-state", action="store_true")
+    run.add_argument(
+        "--continuous",
+        "-c",
+        action="store_true",
+        help="Loop: 1 file per iterazione fino a fine coda",
+    )
+    run.add_argument("--max-rounds", type=int, default=None)
+
+    reset_gap = sub.add_parser(
+        "reset-gap",
+        help="Reset state gap, report e cache upload SOT (mantiene 01_RAW_INGEST)",
+    )
+    reset_gap.add_argument(
+        "--wipe-state",
+        action="store_true",
+        help="Elimina pipeline_state.json invece di rimettere tutti i file a pending",
+    )
+    reset_gap.add_argument(
+        "--keep-allm-cache",
+        action="store_true",
+        help="Non cancellare gap_allm_state (SOT già incorporati in AnythingLLM)",
+    )
 
     return p
 
@@ -298,6 +362,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_ai_gap_analysis(args)
     if args.command == "run":
         return cmd_run(args)
+    if args.command == "reset-gap":
+        return cmd_reset_gap(args)
     return 1
 
 

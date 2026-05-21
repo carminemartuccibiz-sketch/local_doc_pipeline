@@ -15,6 +15,8 @@ _CHARS_PER_TOKEN_FALLBACK = 4
 # Budget token documento grezzo (resto per SOT + risposta)
 DEFAULT_RAW_INPUT_TOKEN_BUDGET = int(os.environ.get("GAP_RAW_INPUT_TOKEN_BUDGET", "6000"))
 DEFAULT_MODEL_CONTEXT = int(os.environ.get("GAP_MODEL_CONTEXT_TOKENS", "8192"))
+# Chunk LLM: più piccolo del budget contesto → analisi per sezione, meno troncamenti
+DEFAULT_GAP_CHUNK_MAX_TOKENS = int(os.environ.get("GAP_CHUNK_MAX_TOKENS", "1500"))
 
 
 @dataclass(slots=True)
@@ -55,12 +57,20 @@ def infer_context_window(model_id: str) -> int:
 
 def resolve_token_limits(model_id: str) -> TokenLimits:
     ctx = infer_context_window(model_id)
+    loaded_cap = int(os.environ.get("LM_NATIVE_CONTEXT", "0") or "0")
+    if loaded_cap > 0:
+        ctx = min(ctx, loaded_cap)
+
+    # ~35% grezzo, ~20% output, resto system/RAG/overhead (LM Studio loaded_context)
     raw_budget = min(
         DEFAULT_RAW_INPUT_TOKEN_BUDGET,
-        int(ctx * 0.45),
+        int(ctx * 0.35),
     )
-    response_reserve = max(1024, int(ctx * 0.2))
-    sot_budget = max(1500, ctx - raw_budget - response_reserve)
+    response_reserve = max(
+        1024,
+        min(int(os.environ.get("GAP_LM_MAX_OUTPUT", "1500")), int(ctx * 0.18)),
+    )
+    sot_budget = max(800, ctx - raw_budget - response_reserve - 800)
     return TokenLimits(
         model_id=model_id,
         context_tokens=ctx,
@@ -68,6 +78,20 @@ def resolve_token_limits(model_id: str) -> TokenLimits:
         sot_budget_tokens=sot_budget,
         response_reserve=response_reserve,
     )
+
+
+def resolve_chunk_max_tokens(limits: TokenLimits) -> int:
+    """
+    Dimensione massima di ogni chunk inviato al modello (split markdown).
+    Separato da raw_input_budget: evita un solo chunk «full» su file medi.
+    """
+    cap = int(os.environ.get("GAP_CHUNK_MAX_TOKENS", str(DEFAULT_GAP_CHUNK_MAX_TOKENS)))
+    cap = max(400, min(cap, limits.raw_input_budget))
+    return cap
+
+
+def resolve_chunk_min_section_tokens() -> int:
+    return max(100, int(os.environ.get("GAP_CHUNK_MIN_SECTION_TOKENS", "250")))
 
 
 def raw_budget_to_chars(token_budget: int) -> int:

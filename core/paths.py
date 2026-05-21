@@ -3,6 +3,7 @@ Layout cartelle sessione pipeline + discovery documenti SOT (gerarchia tier).
 """
 from __future__ import annotations
 
+import functools
 import re
 from pathlib import Path
 from typing import Iterator
@@ -100,10 +101,18 @@ def _tier_for_path(path: Path, bases: list[tuple[int, Path]]) -> int:
 
 
 def _is_sot_file(path: Path) -> bool:
-    if "/SOT/" in path.as_posix().replace("\\", "/"):
+    posix = path.as_posix().replace("\\", "/")
+    if "/SOT/" in posix:
         return True
+    return _is_sot_file_by_frontmatter(str(path.resolve()))
+
+
+@functools.lru_cache(maxsize=4096)
+def _is_sot_file_by_frontmatter(resolved_path: str) -> bool:
     try:
-        head = path.read_text(encoding="utf-8", errors="replace")[:4000]
+        head = Path(resolved_path).read_bytes()[:512].decode(
+            "utf-8", errors="replace"
+        )
     except OSError:
         return False
     return bool(
@@ -193,7 +202,9 @@ def build_compact_sot_index(sot_parts: list[tuple[str, str]]) -> list[tuple[str,
     compact: list[tuple[str, str]] = []
     for rel, body in sot_parts:
         head = "\n".join(body.strip().splitlines()[:12])
-        compact.append((rel, f"### {rel}\n{head}\n_(dettaglio via RAG LAST DOCS)_\n"))
+        compact.append(
+            (rel, f"### {rel}\n{head}\n_(dettaglio via RAG — LAST DOCS + doc. vecchia)_\n")
+        )
     return compact
 
 

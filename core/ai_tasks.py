@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
+import time
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
@@ -19,41 +21,26 @@ from config import (
     LM_OPENAI_BASE_URL,
     LM_TIMEOUT_S,
     LM_USE_NATIVE_CHAT,
+    PIPELINE_LM_COOLDOWN_S,
+    PIPELINE_MAX_CONCURRENCY,
 )
 from core.context_budget import ContextBundle, build_context_bundle
 from core.report_metadata import build_gap_frontmatter, ensure_spec_document
+from core.token_budget import count_tokens
 
 logger = logging.getLogger(__name__)
 
 # Modello LM Studio risolto a inizio sessione Gap Analysis (auto-discovery)
 _session_lm_model: str | None = None
+_llm_semaphore = threading.Semaphore(
+    max(1, PIPELINE_MAX_CONCURRENCY),
+)
 
-GAP_ANALYSIS_SYSTEM_PROMPT = """Agisci come un revisore di sistemi per DVAMOCLES SWORD™: Material Forge Studio®
-e SIGNUM SENTINEL (documentazione tecnica PBR, pipeline, architettura).
-
-Hai a disposizione la documentazione ufficiale SOT (Source of Truth) e un documento grezzo
-con appunti o trascrizioni.
-
-Il tuo UNICO compito è estrarre le informazioni presenti nel documento grezzo che:
-- NON sono presenti nella documentazione SOT, oppure
-- sono in CONTRADDIZIONE con la SOT.
-
-REGOLE:
-1. NON riassumere il grezzo. NON inventare feature.
-2. Elenca meccaniche, parametri, moduli, workflow, naming, vincoli UI/UX mancanti o divergenti.
-3. Usa sezioni: ## Mancanze rispetto alla SOT, ## Contraddizioni, ## Dettaglio per voce.
-4. Per ogni voce indica riferimento al file grezzo (se fornito nel prompt).
-5. Se non trovi gap, scrivi esplicitamente "_Nessuna mancanza rilevata in questo file_"."""
-
-
-GAP_INTEGRATE_SYSTEM_PROMPT = """Agisci come curatore di un Gap Report cumulativo DVAMOCLES.
-
-Ti viene il report gap ESISTENTE e le NUOVE scoperte da un altro file grezzo.
-Integra le nuove voci senza perdere le precedenti: unisci duplicati, mantieni contraddizioni
-in sezione dedicata, aggiungi timestamp di sessione se utile.
-
-NON è una fusione narrativa: è un registro incrementale di lacune documentali.
-Output: Markdown completo del report aggiornato (sostituisce il precedente)."""
+from core.gap_prompts import (
+    GAP_ANALYSIS_SYSTEM_PROMPT,
+    GAP_CONSOLIDATE_SYSTEM_PROMPT,
+    GAP_INTEGRATE_SYSTEM_PROMPT,
+)
 
 
 class AIBackend(str, Enum):
@@ -299,6 +286,26 @@ def _complete_ollama(
         return r.json()["message"]["content"].strip()
 
 
+def parse_lm_native_response(data: dict[str, Any]) -> str:
+    """Parser unificato per risposte LM Studio API nativa."""
+    parts: list[str] = []
+    for block in data.get("output") or []:
+        if isinstance(block, dict) and block.get("type") == "message":
+            parts.append(str(block.get("content") or ""))
+    text = "\n".join(parts).strip()
+    if not text:
+        for key in ("response", "content", "text"):
+            val = data.get(key)
+            if isinstance(val, str) and val.strip():
+                text = val.strip()
+                break
+    if not text:
+        output = data.get("output")
+        if isinstance(output, str) and output.strip():
+            text = output.strip()
+    return text
+
+
 def _complete_lm_native(system_prompt: str, user_message: str, temperature: float) -> str:
     ctx = int(os.environ.get("LM_NATIVE_CONTEXT", "8192"))
     payload = {
@@ -312,14 +319,34 @@ def _complete_lm_native(system_prompt: str, user_message: str, temperature: floa
         r = client.post(LM_NATIVE_CHAT_URL, json=payload)
         r.raise_for_status()
         data = r.json()
-    parts = []
-    for block in data.get("output") or []:
-        if isinstance(block, dict) and block.get("type") == "message":
-            parts.append(str(block.get("content") or ""))
-    return "\n".join(parts).strip()
+    text = parse_lm_native_response(data)
+    if not text:
+        raise RuntimeError(
+            f"LM native: risposta vuota — payload: {str(data)[:300]}"
+        )
+    return text
 
 
 def llm_complete(
+    *,
+    system_prompt: str,
+    user_message: str,
+    temperature: float = 0.1,
+    max_tokens: int = 4096,
+) -> str:
+    with _llm_semaphore:
+        result = _llm_complete_unlocked(
+            system_prompt=system_prompt,
+            user_message=user_message,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+    if PIPELINE_LM_COOLDOWN_S > 0:
+        time.sleep(PIPELINE_LM_COOLDOWN_S)
+    return result
+
+
+def _llm_complete_unlocked(
     *,
     system_prompt: str,
     user_message: str,
@@ -353,31 +380,48 @@ def llm_complete(
         int(os.environ.get("GAP_LM_MAX_OUTPUT", "2048")),
     )
 
+    est_in = count_tokens(system_prompt + user_message, model_hint=model)
+    ctx_cap = int(os.environ.get("LM_NATIVE_CONTEXT", "0") or "0") or int(
+        os.environ.get("GAP_MODEL_CONTEXT_TOKENS", "8192")
+    )
+    max_in = int(ctx_cap * 0.72) - safe_max
+    if est_in > max_in > 2000:
+        from core.context_budget import truncate_middle
+
+        user_message, _ = truncate_middle(
+            user_message,
+            max(2000, max_in - count_tokens(system_prompt, model_hint=model)),
+            "prompt_utente",
+        )
+        logger.warning(
+            "Prompt ridotto per contesto LM (%d → budget ~%d token input)",
+            est_in,
+            max_in,
+        )
+
     if _prefer_native_lm_api(model):
         try:
             return _complete_lm_native(system_prompt, user_message, temperature)
+        except httpx.HTTPStatusError as e:
+            if e.response is not None and e.response.status_code == 500:
+                body = e.response.text[:200]
+                if "context" in body.lower():
+                    raise RuntimeError(
+                        "LM Studio: contesto superato. Riduci GAP_RAW_INPUT_TOKEN_BUDGET "
+                        "o GAP_RAG_MAX_CHARS in .env, oppure aumenta loaded context nel modello."
+                    ) from e
+            logger.warning("LM native fallita (%s), provo OpenAI-compatible", e)
         except httpx.HTTPError as e:
             logger.warning("LM native fallita (%s), provo OpenAI-compatible", e)
 
-    try:
-        return _complete_openai_compatible(
-            base_url=LM_OPENAI_BASE_URL,
-            model=model,
-            system_prompt=system_prompt,
-            user_message=user_message,
-            temperature=temperature,
-            max_tokens=safe_max,
-        )
-    except httpx.HTTPStatusError as e:
-        detail = ""
-        if e.response is not None:
-            detail = e.response.text[:400]
-        logger.warning(
-            "LM Studio /v1/chat/completions HTTP %s — fallback native. %s",
-            e.response.status_code if e.response else "?",
-            detail,
-        )
-        return _complete_lm_native(system_prompt, user_message, temperature)
+    return _complete_openai_compatible(
+        base_url=LM_OPENAI_BASE_URL,
+        model=model,
+        system_prompt=system_prompt,
+        user_message=user_message,
+        temperature=temperature,
+        max_tokens=safe_max,
+    )
 
 
 def perform_gap_analysis(
@@ -392,6 +436,9 @@ def perform_gap_analysis(
     integrate_report: bool = True,
     rag_context: str = "",
     sot_references: list[str] | None = None,
+    chunk_index: int | None = None,
+    chunks_total: int | None = None,
+    chunk_label: str | None = None,
 ) -> tuple[str, ContextBundle, str]:
     """
     Confronto 1:1 grezzo vs SOT. Ritorna (markdown_da_scrivere, bundle_contesto).
@@ -414,6 +461,14 @@ def perform_gap_analysis(
     )
 
     rag_section = f"\n\n{rag_context}\n" if rag_context.strip() else ""
+    chunk_scope = ""
+    if chunks_total is not None and chunks_total > 0 and chunk_index is not None:
+        part_n = chunk_index + 1
+        lab = chunk_label or "sezione"
+        chunk_scope = (
+            f"\n> **Ambito (chunking):** Parte **{part_n}/{chunks_total}** del file "
+            f"(`{lab}`). Analizza **solo** il testo sotto; altre parti = altre passate LLM.\n"
+        )
     user_delta = f"""# Documentazione SOT (Source of Truth)
 
 {bundle.sot_text}
@@ -423,18 +478,20 @@ def perform_gap_analysis(
 # Documento grezzo da confrontare
 
 **File:** `{raw_rel_path}`
-
+{chunk_scope}
 {bundle.raw_text}
 
 ---
 
-Analizza SOLO gap e contraddizioni rispetto alla SOT. Output in Markdown strutturato."""
+Report **ricco e contestualizzato** per allegarlo a Claude/GPT e aggiornare LAST DOCS.
+Rispetta la struttura del system prompt (Sintesi, GAP numerati, Azioni redazione, Handoff IA)."""
 
+    out_budget = int(os.environ.get("GAP_LM_MAX_OUTPUT", "1536"))
     delta_md = llm_complete(
         system_prompt=GAP_ANALYSIS_SYSTEM_PROMPT,
         user_message=user_delta,
         temperature=0.05,
-        max_tokens=4096,
+        max_tokens=out_budget,
     )
 
     if not integrate_report or not existing_report.strip():
@@ -464,12 +521,64 @@ Produci il Gap Report COMPLETO aggiornato (Markdown)."""
     return merged, bundle, delta_md
 
 
+def consolidate_gap_report_for_handoff(
+    *,
+    rel_key: str,
+    merged_chunk_report: str,
+    sot_refs: list[str],
+    chunks_total: int,
+) -> str:
+    """
+    Unisce analisi multi-chunk in un report unico, ricco, pronto per Claude/GPT.
+    """
+    if not merged_chunk_report.strip():
+        return merged_chunk_report
+    if chunks_total <= 1 and os.environ.get("GAP_REPORT_CONSOLIDATE_SINGLE", "").lower() not in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return merged_chunk_report
+
+    user = f"""# File grezzo
+`{rel_key}` — analizzato in **{chunks_total}** parti (chunk).
+
+# Riferimenti SOT consultati
+{chr(10).join(f"- {r}" for r in (sot_refs or [])[:30])}
+
+---
+
+# Report per chunk (da consolidare senza perdere contesto)
+
+{merged_chunk_report[: int(os.environ.get("GAP_MAX_REPORT_CHARS", "12000"))]}
+
+---
+
+Produci il report consolidato unico, ricco, pronto per handoff a Claude/GPT."""
+    out_budget = int(os.environ.get("GAP_LM_MAX_OUTPUT", "1536"))
+    consolidate_budget = int(
+        os.environ.get("GAP_LM_MAX_OUTPUT_CONSOLIDATE", str(min(2500, out_budget * 2)))
+    )
+    return llm_complete(
+        system_prompt=GAP_CONSOLIDATE_SYSTEM_PROMPT,
+        user_message=user,
+        temperature=0.08,
+        max_tokens=consolidate_budget,
+    )
+
+
 def _format_session_block(raw_rel_path: str, body: str) -> str:
+    """Compat: usa format_general_report_entry per il report cumulativo."""
+    return _format_general_report_entry(raw_rel_path, body)
+
+
+def _format_general_report_entry(raw_rel_path: str, body: str) -> str:
+    """Voce nel Gap_Report_Generale.md — unica destinazione handoff Claude/GPT."""
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     return (
         f"\n\n---\n\n"
-        f"## Sessione gap — {ts}\n\n"
-        f"**File analizzato:** `{raw_rel_path}`\n\n"
+        f"## File grezzo: `{raw_rel_path}`\n\n"
+        f"_Registrato: {ts} — sezione da usare con LAST DOCS per aggiornamento canonico._\n\n"
         f"{body.strip()}\n"
     )
 
@@ -481,6 +590,8 @@ def append_to_report(
     source_file: str = "",
     sot_references: list[str] | None = None,
     raw_source: str | None = None,
+    sot_tiers: str | None = None,
+    is_general_report: bool = False,
 ) -> None:
     if raw_source is not None:
         source_file = raw_source
@@ -492,15 +603,27 @@ def append_to_report(
         prev = p.read_text(encoding="utf-8", errors="replace")
         p.write_text(prev.rstrip() + "\n" + section_md, encoding="utf-8", newline="\n")
     else:
+        tiers = sot_tiers or (
+            "1,2"
+            if os.environ.get("GAP_SOT_LAST_DOCS_ONLY", "true").lower()
+            not in ("1", "true", "yes")
+            else "1"
+        )
         header = build_gap_frontmatter(
             source_file=raw_source or "Gap_Report_Generale.md",
             sot_references=sot_references or [],
-            title="Gap Report Generale",
+            title="Gap Report Generale — handoff aggiornamento LAST DOCS",
+            sot_tiers=tiers,
         )
         intro = (
             "# Gap Report Generale — DVAMOCLES SWORD\n\n"
-            "Registro incrementale: meccaniche/parametri nei documenti grezzi "
-            "**assenti o in contrasto** con la documentazione SOT.\n"
+            "**Documento unico da allegare a Claude o GPT** per aggiornare la suite "
+            "`LAST DOCS/` (tier 1 vince su documentazione vecchia).\n\n"
+            "Ogni sezione `## File grezzo:` corrisponde a un materiale in "
+            "`01_RAW_INGEST/`. Usa **Sintesi**, **GAP-XX**, **Azione di redazione** "
+            "e **Handoff IA** in ogni sezione.\n\n"
+            "## Indice file (cresce ad ogni run)\n\n"
+            "_Le voci compaiono sotto in ordine di analisi._\n"
         )
         p.write_text(header + intro + section_md, encoding="utf-8", newline="\n")
 
@@ -512,12 +635,17 @@ def write_gap_report(
     source_file: str,
     sot_references: list[str] | None = None,
     chunk_label: str | None = None,
+    chunks_total: int | None = None,
+    chunk_labels: list[str] | None = None,
+    sot_tiers: str | None = None,
     replace: bool = True,
 ) -> None:
     from pathlib import Path
 
     p = Path(report_path)
     p.parent.mkdir(parents=True, exist_ok=True)
+    if not replace and p.is_file():
+        return
     content = body_md.strip()
     if not content.startswith("---"):
         content = ensure_spec_document(
@@ -525,6 +653,9 @@ def write_gap_report(
             source_file=source_file,
             sot_references=sot_references or [],
             chunk_label=chunk_label,
+            chunks_total=chunks_total,
+            chunk_labels=chunk_labels,
+            sot_tiers=sot_tiers,
         )
     p.write_text(content + "\n", encoding="utf-8", newline="\n")
 

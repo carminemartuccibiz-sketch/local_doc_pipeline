@@ -67,8 +67,22 @@ GAP_SOT_LAST_DOCS_ONLY: Final[bool] = os.environ.get(
     "GAP_SOT_LAST_DOCS_ONLY", "true"
 ).lower() in ("1", "true", "yes")
 
-# File grezzi processati per esecuzione del .bat (uno alla volta, poi passa al successivo)
-GAP_BATCH_SIZE: Final[int] = int(os.environ.get("GAP_BATCH_SIZE", "10"))
+# Concorrenza LLM / worker (1 = una richiesta alla volta, consigliato su 2080 Ti 11 GB)
+PIPELINE_MAX_CONCURRENCY: Final[int] = max(
+    1, int(os.environ.get("PIPELINE_MAX_CONCURRENCY", "1"))
+)
+PIPELINE_LM_COOLDOWN_S: Final[float] = float(
+    os.environ.get("PIPELINE_LM_COOLDOWN_S", "1.5")
+)
+PIPELINE_CHUNK_COOLDOWN_S: Final[float] = float(
+    os.environ.get("PIPELINE_CHUNK_COOLDOWN_S", "0.5")
+)
+PIPELINE_HARDWARE_PROFILE: Final[str] = os.environ.get(
+    "PIPELINE_HARDWARE_PROFILE", ""
+).strip()
+
+# File grezzi per esecuzione (1 = un file per run, solido su GPU locale)
+GAP_BATCH_SIZE: Final[int] = int(os.environ.get("GAP_BATCH_SIZE", "1"))
 
 # Installazioni locali (riferimento; gli endpoint REST usano le porte standard)
 LM_STUDIO_INSTALL_DIR: Final[Path] = Path(

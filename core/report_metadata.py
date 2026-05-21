@@ -18,6 +18,9 @@ def build_gap_frontmatter(
     title: str | None = None,
     status: str = "gap_identified",
     chunk_label: str | None = None,
+    chunks_total: int | None = None,
+    chunk_labels: list[str] | None = None,
+    sot_tiers: str | None = None,
 ) -> str:
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     name = Path(source_file.replace("\\", "/")).name
@@ -33,11 +36,27 @@ def build_gap_frontmatter(
     ]
     if chunk_label:
         lines.append(f"chunk: \"{_yaml_quote(chunk_label)}\"")
+    if chunks_total is not None and chunks_total > 0:
+        mode = "chunked" if chunks_total > 1 else "single_part"
+        lines.append(f"chunking_total: {chunks_total}")
+        lines.append(f"chunking_mode: {mode}")
+        if chunk_labels:
+            lines.append("chunking_labels:")
+            for lab in chunk_labels[:50]:
+                lines.append(f"  - \"{_yaml_quote(lab)}\"")
     if sot_references:
         lines.append("sot_reference:")
         for ref in sot_references[:40]:
             lines.append(f"  - \"{_yaml_quote(ref)}\"")
-    lines.extend(["report_type: gap_analysis", "---", ""])
+    lines.append("report_type: gap_analysis")
+    lines.append("report_purpose: ai_document_update_handoff")
+    if sot_tiers:
+        lines.append(f"sot_tiers: \"{_yaml_quote(sot_tiers)}\"")
+    lines.append(
+        "ai_usage: \"Allegare a Claude/GPT con LAST DOCS aperti. "
+        "Usare sezioni Azione di redazione e Handoff IA. Tier 1 vince su tier 2.\""
+    )
+    lines.extend(["---", ""])
     return "\n".join(lines)
 
 
@@ -48,6 +67,9 @@ def ensure_spec_document(
     sot_references: list[str] | None = None,
     title: str | None = None,
     chunk_label: str | None = None,
+    chunks_total: int | None = None,
+    chunk_labels: list[str] | None = None,
+    sot_tiers: str | None = None,
 ) -> str:
     if body.lstrip().startswith("---"):
         return body
@@ -56,5 +78,8 @@ def ensure_spec_document(
         sot_references=sot_references,
         title=title,
         chunk_label=chunk_label,
+        chunks_total=chunks_total,
+        chunk_labels=chunk_labels,
+        sot_tiers=sot_tiers,
     )
     return fm + body.lstrip()

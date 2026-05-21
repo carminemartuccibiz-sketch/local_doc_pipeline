@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 from config import DEFAULT_SOURCE_ROOT
-from core.gap_runner import run_resilient_gap_pipeline
+from core.gap_runner import run_continuous_gap_pipeline, run_resilient_gap_pipeline
 from core.ingest_copy import populate_raw_ingest
 from core.paths import raw_ingest_dir, session_state_path
 from core.preflight import LocalAIPreflightError, run_preflight_checks
@@ -37,12 +37,17 @@ def run_autonomous_pipeline(
     skip_allm: bool = False,
     force_allm_sync: bool = False,
     reset_state: bool = False,
+    continuous: bool = False,
+    max_rounds: int | None = None,
 ) -> int:
     repo_root = repo_root.resolve()
     state = PipelineSessionState(session_state_path(repo_root))
 
-    if reset_state and state.path.is_file():
-        state.path.unlink()
+    if reset_state:
+        from core.reset_session import reset_gap_session
+
+        for line in reset_gap_session(repo_root):
+            print(f"  {line}")
         state = PipelineSessionState(session_state_path(repo_root))
 
     print("=" * 60)
@@ -79,22 +84,37 @@ def run_autonomous_pipeline(
     print(f"     Ingest: {raw_ingest_dir(repo_root)}\n")
 
     try:
-        n = run_resilient_gap_pipeline(
-            repo_root=repo_root,
-            limit=limit,
-            append_only=append_only,
-            skip_allm=skip_allm,
-            force_allm_sync=force_allm_sync,
-            state=state,
-        )
+        if continuous:
+            per_iter = max(1, limit or 1)
+            n = run_continuous_gap_pipeline(
+                repo_root=repo_root,
+                append_only=append_only,
+                skip_allm=skip_allm,
+                force_allm_sync=force_allm_sync,
+                state=state,
+                files_per_iteration=per_iter,
+                max_rounds=max_rounds,
+            )
+        else:
+            n = run_resilient_gap_pipeline(
+                repo_root=repo_root,
+                limit=limit,
+                append_only=append_only,
+                skip_allm=skip_allm,
+                force_allm_sync=force_allm_sync,
+                state=state,
+            )
     except RuntimeError as e:
         logging.error("%s", e)
         return 2
     except LocalAIPreflightError:
         return 2
+    except KeyboardInterrupt:
+        print("\n\nInterrotto dall'utente (Ctrl+C). Lo state e' salvato — rilancia per riprendere.")
+        return 130
 
     if n == 0:
-        print("\nNessun file processato (tutti completati o server non pronti).")
+        print("\nNessun file processato (coda vuota o server non pronti).")
         return 0
 
     print(f"\nCompletato: {n} file analizzati in questa esecuzione.")
@@ -128,6 +148,18 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Azzera pipeline_state.json prima di partire",
     )
+    parser.add_argument(
+        "--continuous",
+        "-c",
+        action="store_true",
+        help="Loop automatico: 1 file per iterazione fino a fine coda (usa con --limit 1)",
+    )
+    parser.add_argument(
+        "--max-rounds",
+        type=int,
+        default=None,
+        help="Con --continuous: stop dopo N iterazioni (default: illimitato)",
+    )
     args = parser.parse_args(argv)
     setup_logging(args.verbose)
     return run_autonomous_pipeline(
@@ -140,6 +172,8 @@ def main(argv: list[str] | None = None) -> int:
         skip_allm=args.skip_allm,
         force_allm_sync=args.force_allm_sync,
         reset_state=args.reset_state,
+        continuous=args.continuous,
+        max_rounds=args.max_rounds,
     )
 
 

@@ -5,8 +5,10 @@ param(
     [switch]$ForceAllmSync,
     [switch]$SkipIngest,
     [switch]$ResetState,
-    [int]$Limit = 10,
-    [switch]$FullIngest
+    [int]$Limit = 1,
+    [switch]$FullIngest,
+    [switch]$SingleRun,
+    [int]$MaxRounds = 0
 )
 
 $ErrorActionPreference = "Stop"
@@ -41,8 +43,13 @@ try {
 $argsList = @("orchestrator.py")
 if (-not $FullIngest) { $argsList += "--skip-ingest" }
 $argsList += "--limit", $Limit
+if (-not $SingleRun) { $argsList += "--continuous" }
+if ($MaxRounds -gt 0) { $argsList += "--max-rounds", $MaxRounds }
 if ($ForceAllmSync) { $argsList += "--force-allm-sync" }
 if ($ResetState) { $argsList += "--reset-state" }
+if (-not $SingleRun) {
+    Write-Host "  Modalita: CONTINUA (1 file alla volta, prossimo automatico). -SingleRun per un solo file."
+}
 
 Write-Host "`n[RUN] python $($argsList -join ' ')`n"
 python @argsList

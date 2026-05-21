@@ -91,8 +91,12 @@ Guida operativa: [`DVAMOCLES_WORKSPACE/00_START_PIPELINE_GUIDE.md`](../../DVAMOC
 | `LM_STUDIO_MODEL` | `auto` | Discovery via `/v1/models` |
 | `LM_USE_NATIVE_CHAT` | `true` | API nativa LM (consigliato con modelli VL) |
 | `GAP_SOT_LAST_DOCS_ONLY` | `true` | Solo `LAST DOCS/` come SOT |
-| `GAP_BATCH_SIZE` | `10` | File grezzi per esecuzione |
-| `GAP_RAW_INPUT_TOKEN_BUDGET` | `6000` | Budget token per chunk grezzo |
+| `PIPELINE_MAX_CONCURRENCY` | `1` | Richieste LLM in parallelo (1 = solido su 2080 Ti) |
+| `GAP_BATCH_SIZE` | `1` | File grezzi per esecuzione |
+| `GAP_CHUNK_MAX_TOKENS` | `1200` | Dimensione chunk analisi |
+| `GAP_RAW_INPUT_TOKEN_BUDGET` | `3500` | Budget token contesto grezzo |
+
+Profilo **i9 + 2080 Ti + 32 GB**: vedi `HARDWARE_i9_2080Ti.md` e LM Studio **Max concurrent predictions = 1**.
 
 Vedi `.env.example` per l’elenco completo.
 
@@ -102,18 +106,23 @@ Vedi `.env.example` per l’elenco completo.
 
 ```powershell
 python cli.py check
-python cli.py run                    # = orchestrator (ingest opzionale + gap)
-python cli.py run --skip-ingest --limit 10
+python cli.py run                    # = orchestrator continuo (default start script)
+python cli.py run --skip-ingest --continuous --limit 1
+python cli.py run --skip-ingest --limit 1   # un solo file (no loop)
 python cli.py init-ingest
 python cli.py ai-gap-analysis --target-path 01_RAW_INGEST --limit 1
 ```
 
-**Output gap:** `02_SESSION_MEMORY/GAP_ANALYSIS_REPORTS/`
+**Output handoff (unico):** `02_SESSION_MEMORY/GAP_ANALYSIS_REPORTS/Gap_Report_Generale.md` — allega solo questo a Claude/GPT (`HANDOFF_REPORTS.md`). I `GAP_*.md` per-file sono off by default.
+
+Con `GAP_SOT_LAST_DOCS_ONLY=false` confronta anche `Documentazione vecchia/` (tier 2); in AnythingLLM incorpora entrambe le cartelle nel workspace SOT.
 
 | Flag | Descrizione |
 |------|-------------|
 | `--skip-ingest` | Salta copia in `01_RAW_INGEST` |
-| `--limit N` | Max file grezzi per run |
+| `--limit N` | File per iterazione (con `--continuous`: 1 = uno alla volta in loop) |
+| `--continuous` | Loop automatico fino a fine coda |
+| `--max-rounds N` | Stop dopo N iterazioni (test) |
 | `--force-allm-sync` | Re-indicizza LAST DOCS su AnythingLLM |
 | `--append-only` | Report cumulativo senza merge LLM pesante |
 
@@ -136,7 +145,8 @@ Convert → embed AnythingLLM → extract LM → `Dvamocles_Pre_Claude_Refactor/
 | `400` LM completions | `LM_USE_NATIVE_CHAT=true` o modello non-VL |
 | `vector-search` workspace invalid | `.\start_dvamocles_pipeline.ps1 -ForceAllmSync` |
 | File completato senza analisi | Resume chunk corrotto — il runner resetta da chunk 0 |
-| Run troppo lenta | `--limit 3`, modello più piccolo, batch 10/run |
+| OOM / context exceeded | LM Studio concurrent **1**, abbassa `GAP_CHUNK_MAX_TOKENS` |
+| Run troppo lenta (atteso) | Profilo solido: `-Limit 1`, lascia girare overnight |
 
 ---
 
