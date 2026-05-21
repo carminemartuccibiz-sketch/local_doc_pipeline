@@ -2,6 +2,12 @@
 
 Indice della documentazione di progetto e del blueprint Cursor.
 
+## Primo avvio (installazione → UI)
+
+| Documento | Uso |
+|-----------|-----|
+| [`PRIMO_AVVIO.md`](PRIMO_AVVIO.md) | Guida passo passo: venv, dipendenze, `.env`, LM Studio, avvio :7842 |
+
 ## Blueprint principale (sorgente di verità architetturale)
 
 | Documento | Contenuto |
