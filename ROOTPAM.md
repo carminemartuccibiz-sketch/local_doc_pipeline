@@ -2,7 +2,7 @@
 
 Mappa architetturale per handoff tra sessioni IA. Le righe `↳ [🧠 STORICO AI]` sono aggiornate da `scripts/update_dev_router.py` leggendo `AI_DEV_SESSIONS/`.
 
-**Ultimo aggiornamento router:** 2026-05-22T17:41:50Z
+**Ultimo aggiornamento router:** 2026-05-22T17:54:51Z
 
 ---
 
