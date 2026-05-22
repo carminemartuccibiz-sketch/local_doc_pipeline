@@ -2,7 +2,7 @@
 
 Mappa architetturale per handoff tra sessioni IA. Le righe `↳ [🧠 STORICO AI]` sono aggiornate da `scripts/update_dev_router.py` leggendo `AI_DEV_SESSIONS/`.
 
-**Ultimo aggiornamento router:** 2026-05-21T18:49:06Z
+**Ultimo aggiornamento router:** 2026-05-22T17:41:50Z
 
 ---
 
@@ -91,3 +91,7 @@ Mappa architetturale per handoff tra sessioni IA. Le righe `↳ [🧠 STORICO AI
 - projects/<slug>/: Progetti UI (gitignore contenuto).
 - data/: Ingest CLI, session memory, log pipeline.
 - logs/: `api_interactions.json` (5 entry), `app_system.log`.
+
+## File toccati dalle IA (non ancora in mappa)
+- requirements.txt: _(aggiungere descrizione in ROOTPAM)_
+↳ [🧠 STORICO AI]: Modificato da Cursor il 2026-05-22 [completed]. Next: Procedere con i test dell'interfaccia UI e dell'ingestion. _(log: 20260522_1941_dependabot_sync.md)_
