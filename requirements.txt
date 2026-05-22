@@ -4,7 +4,7 @@ tiktoken>=0.7,<1.0
 tqdm>=4.66,<5.0
 httpx>=0.28.1,<1.0
 beautifulsoup4>=4.12,<5
-pypdf>=4.0
+pypdf>=6.12.1
 python-docx>=1.2.0
 
 # UI orchestratore desktop (FASE 6–8)
