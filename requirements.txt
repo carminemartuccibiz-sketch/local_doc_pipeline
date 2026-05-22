@@ -9,7 +9,7 @@ python-docx>=1.2.0
 
 # UI orchestratore desktop (FASE 6–8)
 flask>=3.1.3,<4.0
-flask-cors>=4.0,<5.0
+flask-cors>=6.0.2,<7.0
 pywebview>=6.2.1,<7.0
 
 # Opzionale — PDF/DOCX migliori (come Motore_Dvamocles)
