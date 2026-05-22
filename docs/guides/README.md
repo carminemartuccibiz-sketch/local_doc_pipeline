@@ -2,6 +2,17 @@
 
 Indice della documentazione di progetto e del blueprint Cursor.
 
+## Meta-sviluppo (handoff IA sul repo software)
+
+| Risorsa | Uso |
+|---------|-----|
+| [`../../ROOTPAM.md`](../../ROOTPAM.md) | Mappa repo + storico modifiche IA (auto) |
+| [`../../AI_DEV_SESSIONS/README.md`](../../AI_DEV_SESSIONS/README.md) | Log sessioni coding |
+| `python scripts/update_dev_router.py` | Aggiorna ROOTPAM da `AI_DEV_SESSIONS/` |
+| `python scripts/generate_repomix.py` | Genera `_LLM_CONTEXT_DUMP.txt` per Claude/Cursor |
+
+**Consiglio:** esegui `generate_repomix` **solo prima di esportare** il contesto — non collegarlo a `dvamocles_daemon.bat` (avvio runtime utente).
+
 ## Primo avvio (installazione → UI)
 
 | Documento | Uso |

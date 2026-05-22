@@ -8,7 +8,7 @@ Guida Windows (PowerShell) da zero all’UI su http://127.0.0.1:7842.
 
 | Componente | Versione / nota |
 |------------|-----------------|
-| **Python** | 3.10+ (`python --version`) |
+| **Python** | **3.10–3.12** consigliato (`py -3.10 --version`). Evita 3.14 per `pywebview`. |
 | **LM Studio** | Server locale attivo su `http://localhost:1234` |
 | **AnythingLLM** | Solo se usi **gap_analysis** con RAG (`http://localhost:3001`) |
 | **Git** | Opzionale (repo già clonato) |
@@ -26,9 +26,13 @@ cd E:\DVAMOCLES-SWORD-AMBIENT-FULL-DOCUMENTATION\tools\local_doc_pipeline
 ## 2. Ambiente virtuale Python
 
 ```powershell
-python -m venv .venv
+.\scripts\setup_venv.ps1
 .\.venv\Scripts\Activate.ps1
 ```
+
+Lo script ripara anche la cartella `.vnev` (typo) rinominandola in `.venv`, e usa **Python 3.10** se disponibile (`py -3.10`).
+
+Ricreazione forzata: `$env:FORCE_VENV_RECREATE='1'; .\scripts\setup_venv.ps1`
 
 Se PowerShell blocca gli script:
 
