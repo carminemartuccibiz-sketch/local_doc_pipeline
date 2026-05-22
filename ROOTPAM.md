@@ -2,7 +2,7 @@
 
 Mappa architetturale per handoff tra sessioni IA. Le righe `↳ [🧠 STORICO AI]` sono aggiornate da `scripts/update_dev_router.py` leggendo `AI_DEV_SESSIONS/`.
 
-**Ultimo aggiornamento router:** 2026-05-22T17:54:51Z
+**Ultimo aggiornamento router:** 2026-05-22T18:08:52Z
 
 ---
 
@@ -10,14 +10,17 @@ Mappa architetturale per handoff tra sessioni IA. Le righe `↳ [🧠 STORICO AI
 
 - app.py: PyWebView + thread Flask; fallback browser (`--browser`).
 - server.py: Backend Flask UI, API REST, SSE log stream (porta 7842).
+↳ [🧠 STORICO AI]: Modificato da Cursor il 2026-05-22 [completed]. Next: Smoke test: test_workflow su UI, poi ingest con LM Studio attivo. _(log: 20260522_ui_deadlock_fix.md)_
 - dvamocles_daemon.ps1: Crea/attiva venv, installa deps, avvia `server.py`.
 - dvamocles_daemon.bat: Wrapper PowerShell per Windows.
 
 ## engine/ — Motore orchestrazione
 
 - engine/orchestrator.py: Kill switch 3 livelli, JobQueue, stato condiviso UI/worker, log SSE.
+↳ [🧠 STORICO AI]: Modificato da Cursor il 2026-05-22 [completed]. Next: Smoke test: test_workflow su UI, poi ingest con LM Studio attivo. _(log: 20260522_ui_deadlock_fix.md)_
 ↳ [🧠 STORICO AI]: Modificato da Cursor-Agent il 2026-05-21 [completed]. Next: Aggiungere sessioni reali dopo ogni chat; lanciare generate_repomix prima di handoff Claude _(log: 20260521_cursor_orchestrator_bootstrap.md)_
 - engine/job_runner.py: Worker coda job, ingest sliding window, gap_analysis via workflow.
+↳ [🧠 STORICO AI]: Modificato da Cursor il 2026-05-22 [completed]. Next: Smoke test: test_workflow su UI, poi ingest con LM Studio attivo. _(log: 20260522_ui_deadlock_fix.md)_
 ↳ [🧠 STORICO AI]: Modificato da Cursor-Agent il 2026-05-21 [completed]. Next: Aggiungere sessioni reali dopo ogni chat; lanciare generate_repomix prima di handoff Claude _(log: 20260521_cursor_orchestrator_bootstrap.md)_
 - engine/job_queue.py: PriorityQueue job con priorità e drain.
 - engine/ingest_processor.py: Sliding window chunking, `chunks.json`, `analysis.md` per file.
@@ -26,6 +29,7 @@ Mappa architetturale per handoff tra sessioni IA. Le righe `↳ [🧠 STORICO AI
 - engine/project_store.py: CRUD progetti `projects/<slug>/`, ruoli file, dedup MD5 ingest.
 - engine/project_memory.py: Path `04_MEMORY/` per progetto (state, manifest, report).
 - engine/workflow_runner.py: Registry plugin workflow.
+↳ [🧠 STORICO AI]: Modificato da Cursor il 2026-05-22 [completed]. Next: Smoke test: test_workflow su UI, poi ingest con LM Studio attivo. _(log: 20260522_ui_deadlock_fix.md)_
 - engine/interaction_logger.py: Log rolling API (5 interazioni) + `app_system.log`.
 ↳ [🧠 STORICO AI]: Modificato da Cursor-Agent il 2026-05-21 [completed]. Next: Aggiungere sessioni reali dopo ogni chat; lanciare generate_repomix prima di handoff Claude _(log: 20260521_cursor_orchestrator_bootstrap.md)_
 
@@ -67,6 +71,7 @@ Mappa architetturale per handoff tra sessioni IA. Le righe `↳ [🧠 STORICO AI
 
 - ui/templates/index.html: Layout 3 colonne orchestratore.
 - ui/static/app.js: SSE log, progetti, job START/STOP/RESET.
+↳ [🧠 STORICO AI]: Modificato da Cursor il 2026-05-22 [completed]. Next: Smoke test: test_workflow su UI, poi ingest con LM Studio attivo. _(log: 20260522_ui_deadlock_fix.md)_
 - ui/static/style.css: Tema chiaro minimal.
 
 ## legacy/ — CLI pipeline documentale (isolata)
@@ -92,6 +97,13 @@ Mappa architetturale per handoff tra sessioni IA. Le righe `↳ [🧠 STORICO AI
 - data/: Ingest CLI, session memory, log pipeline.
 - logs/: `api_interactions.json` (5 entry), `app_system.log`.
 
-## File toccati dalle IA (non ancora in mappa)
-- requirements.txt: _(aggiungere descrizione in ROOTPAM)_
+## Dipendenze e CI
+
+- requirements.txt: Dipendenze pip (Dependabot weekly); Flask 3.1+, pywebview 6+, httpx 0.28+.
 ↳ [🧠 STORICO AI]: Modificato da Cursor il 2026-05-22 [completed]. Next: Procedere con i test dell'interfaccia UI e dell'ingestion. _(log: 20260522_1941_dependabot_sync.md)_
+
+## File toccati dalle IA (non ancora in mappa)
+- tests/test_job_runner.py: _(aggiungere descrizione in ROOTPAM)_
+↳ [🧠 STORICO AI]: Modificato da Cursor il 2026-05-22 [completed]. Next: Smoke test: test_workflow su UI, poi ingest con LM Studio attivo. _(log: 20260522_ui_deadlock_fix.md)_
+- workflows/test_workflow.py: _(aggiungere descrizione in ROOTPAM)_
+↳ [🧠 STORICO AI]: Modificato da Cursor il 2026-05-22 [completed]. Next: Smoke test: test_workflow su UI, poi ingest con LM Studio attivo. _(log: 20260522_ui_deadlock_fix.md)_

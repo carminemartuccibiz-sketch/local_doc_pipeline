@@ -46,22 +46,42 @@
     };
   }
 
-  function setJobUi(running, stopped) {
-    jobRunning = running;
-    $("btn-start").disabled = running;
-    $("btn-stop").disabled = !running;
-    $("btn-reset").disabled = !stopped;
-    const badge = $("job-badge");
-    badge.textContent = running ? "Running" : stopped ? "Stopped" : "Idle";
-    badge.className = "pill " + (running ? "running" : stopped ? "stopped" : "");
+  function setJobUi(status) {
+    // status: "running" | "stopped" | "failed" | "idle"
+    jobRunning = status === "running";
 
-    if (running && !refreshTimer) {
+    $("btn-start").disabled = status === "running";
+    $("btn-stop").disabled = status !== "running";
+    $("btn-reset").disabled = status === "running" || status === "idle";
+
+    const badge = $("job-badge");
+    badge.className = "pill";
+
+    switch (status) {
+      case "running":
+        badge.textContent = "Running";
+        badge.classList.add("running");
+        break;
+      case "stopped":
+        badge.textContent = "Stopped";
+        badge.classList.add("stopped");
+        break;
+      case "failed":
+        badge.textContent = "Failed";
+        badge.classList.add("stopped"); // rosso
+        break;
+      default:
+        badge.textContent = "Idle";
+    }
+
+    // Auto-refresh durante esecuzione
+    if (status === "running" && !refreshTimer) {
       refreshTimer = setInterval(() => {
         if (currentSlug) loadProject(currentSlug);
         pollJobStatus();
-      }, 5000);
+      }, 3000);
     }
-    if (!running && refreshTimer) {
+    if (status !== "running" && refreshTimer) {
       clearInterval(refreshTimer);
       refreshTimer = null;
     }
@@ -92,10 +112,30 @@
   async function pollJobStatus() {
     try {
       const st = await api("/api/jobs/status");
-      updateStats(st.job);
-      setJobUi(st.running, st.stop_requested && !st.running);
+      const job = st.job;
+
+      updateStats(job);
+
+      const failed = job && job.status === "failed";
+      const stopped = st.stop_requested && !st.running;
+      const completed = job && job.status === "completed" && !st.running;
+
+      // FIX Task 3: sblocca UI su fail/stop/complete
+      if (st.running) {
+        setJobUi("running");
+      } else if (failed) {
+        setJobUi("failed");
+        appendLog({
+          msg: `[JOB] ✗ Job fallito: ${job.error || "errore sconosciuto"}`,
+          level: "ERROR",
+        });
+      } else if (stopped) {
+        setJobUi("stopped");
+      } else {
+        setJobUi("idle");
+      }
     } catch (e) {
-      console.warn(e);
+      console.warn("[pollJobStatus]", e);
     }
   }
 
@@ -114,17 +154,26 @@
   }
 
   async function loadWorkflows() {
-    const { workflows } = await api("/api/workflows").catch(() => ({
-      workflows: [{ id: "ingest", label: "Ingest" }],
-    }));
-    const sel = $("workflow-select");
-    sel.innerHTML = "";
-    (workflows || []).forEach((w) => {
-      const opt = document.createElement("option");
-      opt.value = w.id;
-      opt.textContent = w.label || w.id;
-      sel.appendChild(opt);
-    });
+    try {
+      // FIX: il server ora restituisce { workflows: [...] }
+      const data = await api("/api/workflows");
+      const list = Array.isArray(data) ? data : (data.workflows || []);
+      const sel = $("workflow-select");
+      sel.innerHTML = "";
+      if (!list.length) {
+        sel.innerHTML = '<option value="ingest">Ingest (default)</option>';
+        return;
+      }
+      list.forEach((w) => {
+        const opt = document.createElement("option");
+        opt.value = w.id;
+        opt.textContent = w.label || w.id;
+        sel.appendChild(opt);
+      });
+    } catch (e) {
+      console.warn("[loadWorkflows] fallback:", e);
+      $("workflow-select").innerHTML = '<option value="ingest">Ingest</option>';
+    }
   }
 
   async function loadModels() {
@@ -218,9 +267,16 @@
 
   $("btn-start").addEventListener("click", async () => {
     if (!currentSlug) {
-      alert("Seleziona un progetto");
+      alert("Seleziona un progetto prima di avviare");
       return;
     }
+    const workflow = $("workflow-select").value;
+    if (!workflow) {
+      alert("Seleziona un workflow");
+      return;
+    }
+
+    // Applica profilo
     try {
       await api("/api/profiles/select", {
         method: "POST",
@@ -229,39 +285,47 @@
           project: currentSlug,
         }),
       });
+    } catch (e) {
+      appendLog({ msg: `[UI] Profilo: ${e.message}`, level: "WARN" });
+    }
+
+    // Avvia job
+    try {
+      $("btn-start").disabled = true; // feedback immediato
       const job = await api("/api/jobs/start", {
         method: "POST",
-        body: JSON.stringify({
-          project: currentSlug,
-          workflow: $("workflow-select").value,
-        }),
+        body: JSON.stringify({ project: currentSlug, workflow }),
       });
       updateStats(job);
-      setJobUi(true, false);
-      appendLog({ msg: "[UI] Job avviato", level: "INFO" });
+      setJobUi("running");
+      appendLog({ msg: `[UI] ▶ Job avviato — workflow=${workflow}`, level: "INFO" });
     } catch (e) {
-      alert(e.message);
+      $("btn-start").disabled = false;
+      appendLog({ msg: `[UI] ✗ Errore avvio: ${e.message}`, level: "ERROR" });
+      alert(`Impossibile avviare: ${e.message}`);
     }
   });
 
   $("btn-stop").addEventListener("click", async () => {
-    const res = await fetch("/api/jobs/stop", { method: "POST" });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || res.statusText);
-    appendLog({ msg: `[STOP] ${data.message}`, level: "WARN" });
-    $("btn-start").disabled = true;
-    $("btn-stop").disabled = true;
-    $("btn-reset").disabled = false;
-    setJobUi(false, true);
-    pollJobStatus();
+    $("btn-stop").disabled = true; // evita doppio click
+    try {
+      const data = await api("/api/jobs/stop", { method: "POST" });
+      appendLog({ msg: `[STOP] ${data.message}`, level: "WARN" });
+      setJobUi("stopped");
+    } catch (e) {
+      appendLog({ msg: `[STOP] Errore: ${e.message}`, level: "ERROR" });
+    }
   });
 
   $("btn-reset").addEventListener("click", async () => {
-    await api("/api/jobs/reset", { method: "POST" });
-    appendLog({ msg: "[UI] Orchestrator reset", level: "INFO" });
-    setJobUi(false, false);
-    updateStats(null);
-    pollJobStatus();
+    try {
+      await api("/api/jobs/reset", { method: "POST" });
+      appendLog({ msg: "[UI] Orchestrator pronto per un nuovo job", level: "INFO" });
+      setJobUi("idle");
+      updateStats(null);
+    } catch (e) {
+      appendLog({ msg: `[RESET] Errore: ${e.message}`, level: "ERROR" });
+    }
   });
 
   $("role-modal-cancel").addEventListener("click", closeRoleModal);

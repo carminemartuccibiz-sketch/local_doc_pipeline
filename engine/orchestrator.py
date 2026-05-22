@@ -30,8 +30,19 @@ class OrchestratorState:
     active_requests: list[httpx.Client] = field(default_factory=list)
     job_queue: JobQueue = field(default_factory=JobQueue)
     current_job: dict[str, Any] | None = None
+    # Task 3 (DiagnosiTre cav): persiste dopo completamento/stop (doc: _last_job)
+    last_job: dict[str, Any] | None = None
     log_stream: Queue = field(default_factory=Queue)
     _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    @property
+    def _last_job(self) -> dict[str, Any] | None:
+        """Alias blueprint (Task 3) — stesso campo di last_job."""
+        return self.last_job
+
+    @_last_job.setter
+    def _last_job(self, value: dict[str, Any] | None) -> None:
+        self.last_job = value
 
     @property
     def active_http_clients(self) -> list[httpx.Client]:
@@ -99,6 +110,9 @@ class OrchestratorState:
         except Exception:
             pass
 
+        # FIX Task 3: salva ultimo stato prima di azzerare current_job
+        if self.current_job:
+            self._last_job = {**self.current_job, "status": "stopped"}
         self.current_job = None
         self.emit_log("STOP attivato", level="WARN")
 

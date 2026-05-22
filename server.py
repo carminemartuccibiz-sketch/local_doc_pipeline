@@ -101,12 +101,21 @@ def api_projects_roles(slug: str):
 
 @app.get("/api/workflows")
 def api_workflows_list():
-    ingest = [
-        {"id": "ingest", "label": "Ingest (sliding window)"},
-        {"id": "sliding_window", "label": "Sliding window"},
+    """
+    FIX: restituisce {"workflows": [...]} (non array diretto).
+    app.js destruttura const { workflows } = await api("/api/workflows").
+    """
+    ingest_workflows = [
+        {"id": "ingest", "label": "Ingest (Sliding Window)"},
+        {"id": "test_workflow", "label": "Test (no LLM, 3 step)"},
     ]
-    plugin = [{"id": k, "label": k.replace("_", " ").title()} for k in WorkflowRunner.registered()]
-    return jsonify(ingest + plugin)
+    ingest_ids = {w["id"] for w in ingest_workflows}
+    plugin_workflows = [
+        {"id": k, "label": k.replace("_", " ").title()}
+        for k in WorkflowRunner.registered()
+        if k not in ingest_ids
+    ]
+    return jsonify({"workflows": ingest_workflows + plugin_workflows})
 
 
 @app.get("/api/models")
@@ -180,20 +189,22 @@ def api_profiles_select():
 @app.post("/api/jobs/start")
 def api_jobs_start():
     body = request.get_json(silent=True) or {}
-    slug = body.get("project") or body.get("slug")
-    workflow = body.get("workflow")
+    slug = (body.get("project") or body.get("slug") or "").strip()
+    workflow = (body.get("workflow") or "").strip() or None
+
     if not slug:
-        return jsonify({"error": "project richiesto"}), 400
+        return jsonify({"error": "Campo 'project' obbligatorio"}), 400
+
     try:
-        job = start_job(slug=str(slug), workflow=workflow)
-        return jsonify(job)
+        job = start_job(slug=slug, workflow=workflow)
+        return jsonify(job), 202
     except RuntimeError as e:
         return jsonify({"error": str(e)}), 409
-    except FileNotFoundError:
-        return jsonify({"error": "progetto non trovato"}), 404
+    except FileNotFoundError as e:
+        return jsonify({"error": str(e)}), 404
     except Exception as e:
-        logger.exception("start job")
-        return jsonify({"error": str(e)}), 500
+        logger.exception("Errore avvio job")
+        return jsonify({"error": f"Errore interno: {e}"}), 500
 
 
 @app.post("/api/stop")
@@ -225,13 +236,20 @@ def api_jobs_reset():
 
 @app.get("/api/jobs/status")
 def api_jobs_status():
+    """
+    FIX Task 3: espone anche l'ultimo job (failed/completed) dopo che current_job
+    è stato azzerato, così la UI può mostrare FAILED e abilitare RESET.
+    """
     state = get_orchestrator_state()
     job = state.current_job
+    last = state._last_job
+    displayed_job = job if job is not None else last
+
     return jsonify(
         {
             "running": is_job_running(),
             "stop_requested": state.stop_event.is_set(),
-            "job": job,
+            "job": displayed_job,
         }
     )
 

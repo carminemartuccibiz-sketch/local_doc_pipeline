@@ -1,25 +1,28 @@
 """
 Esecuzione job in background — coda orchestrator + ingest / gap (FASE 6).
+
+FIXES (docs/guides/claude-commands-dir/## DiagnosiTre cav.md):
+  - RLock per rientranza start_job → _ensure_worker
+  - Worker loop: blocca solo se current_job.status == "running" (non su qsize)
+  - is_job_running(): current_job attivo O job ancora in coda (anti doppio START)
+  - Error propagation verso UI via emit_log + last_job
 """
 from __future__ import annotations
 
 import logging
 import threading
 import time
-from pathlib import Path
 from typing import Any
 
 from config.hardware_profiles import PROFILE_ALIASES, PROFILES
 from core.ai_tasks import init_gap_analysis_session, llm_complete
 from core.token_budget import resolve_chunk_max_tokens
 from engine.cooldown_manager import get_cooldown_manager
-from engine.interaction_logger import get_interaction_logger, log_app_system
 from engine.ingest_processor import sliding_window_analyze
 from engine.model_router import get_model_router
 from engine.orchestrator import get_orchestrator_state, reset_orchestrator
 from engine.project_memory import ingest_dir
 from engine.project_store import list_ingest_sources, load_project, mark_ingest_file_done
-from workflows.gap_analysis import run_project_gap_analysis
 
 _UI_PROFILE_ALIASES = {
     **PROFILE_ALIASES,
@@ -27,10 +30,12 @@ _UI_PROFILE_ALIASES = {
     "deep": "I9_2080TI_32GB",
 }
 
+_SKIP_LM_WORKFLOWS = frozenset({"test_workflow"})
+
 logger = logging.getLogger(__name__)
 
+_worker_lock = threading.RLock()
 _worker_thread: threading.Thread | None = None
-_worker_lock = threading.Lock()
 
 
 def apply_hardware_profile(profile_name: str) -> dict[str, str]:
@@ -43,22 +48,32 @@ def apply_hardware_profile(profile_name: str) -> dict[str, str]:
         resolved = resolved.upper()
     profile = PROFILES.get(resolved)
     if not profile:
-        raise ValueError(f"Profilo sconosciuto: {profile_name}")
-
+        raise ValueError(f"Profilo sconosciuto: {profile_name!r}")
     for env_key, value in profile.items():
         os.environ[env_key] = str(value)
     return dict(profile)
 
 
 def is_job_running() -> bool:
+    """
+    True se un job è in esecuzione, in coda (current_job) o ancora nella PriorityQueue.
+    Non usare questa funzione nel worker loop (causerebbe deadlock con qsize).
+    """
     state = get_orchestrator_state()
     job = state.current_job
-    if job and job.get("status") in ("running", "queued"):
+    if job is not None and job.get("status") in ("running", "queued"):
         return True
     return state.job_queue.qsize() > 0
 
 
+def _worker_busy(state) -> bool:
+    """Il worker attende solo se un job è già in stato running."""
+    job = state.current_job
+    return job is not None and job.get("status") == "running"
+
+
 def _ensure_worker() -> None:
+    """Avvia il thread worker se non è vivo. Sicuro con RLock."""
     global _worker_thread
     with _worker_lock:
         if _worker_thread is not None and _worker_thread.is_alive():
@@ -69,27 +84,36 @@ def _ensure_worker() -> None:
             daemon=True,
         )
         _worker_thread.start()
+        logger.info("Worker thread avviato")
+
+
+def _persist_last_job_result(state) -> None:
+    """Conserva l'ultimo risultato per /api/jobs/status (Task 3: last_job / _last_job)."""
+    if state.current_job:
+        state._last_job = dict(state.current_job)
+    # Se current_job è già None (es. kill_all), non cancellare last_job impostato da STOP.
 
 
 def _job_worker_loop() -> None:
     while True:
         state = get_orchestrator_state()
+
         if state.stop_event.is_set():
             time.sleep(0.3)
             continue
 
-        if is_job_running():
+        if _worker_busy(state):
             time.sleep(0.2)
             continue
 
         payload = state.job_queue.get(timeout=0.5)
         if not payload:
-            time.sleep(0.2)
             continue
 
         slug = str(payload.get("slug") or "")
         workflow = str(payload.get("workflow") or "ingest")
         if not slug:
+            logger.warning("Payload senza slug, skip")
             continue
 
         state.current_job = {
@@ -100,24 +124,38 @@ def _job_worker_loop() -> None:
             "files_completed": 0,
             "files_failed": 0,
             "current_file": None,
+            "error": None,
         }
+        state.emit_log(f"[JOB] ▶ Avvio workflow={workflow} progetto={slug}")
 
         try:
             _run_job_worker(slug, workflow)
         except Exception as e:
-            logger.exception("Job worker errore")
-            state.emit_log(f"[JOB] Errore worker: {e}", level="ERROR")
+            logger.exception("Job worker: errore non gestito per %s", slug)
+            state.emit_log(f"[JOB] Errore critico: {e}", level="ERROR")
             if state.current_job:
                 state.current_job["status"] = "failed"
+                state.current_job["error"] = str(e)[:300]
+
+        _persist_last_job_result(state)
+        state.current_job = None
 
 
 def start_job(*, slug: str, workflow: str | None = None) -> dict[str, Any]:
+    """Accoda un job. RLock evita deadlock con _ensure_worker."""
     with _worker_lock:
         if is_job_running():
-            raise RuntimeError("Un job è già in esecuzione")
+            raise RuntimeError("Un job è già in esecuzione — aspetta o premi STOP")
 
-        meta = load_project(slug)
-        wf = workflow or meta.get("workflow") or "ingest"
+        try:
+            meta = load_project(slug)
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Progetto non trovato: {slug}")
+
+        wf = (workflow or meta.get("workflow") or "ingest").strip()
+        if not wf:
+            wf = "ingest"
+
         state = get_orchestrator_state()
         if state.stop_event.is_set():
             reset_orchestrator()
@@ -127,13 +165,22 @@ def start_job(*, slug: str, workflow: str | None = None) -> dict[str, Any]:
         try:
             apply_hardware_profile(prof)
             get_cooldown_manager().reload()
+            state.emit_log(f"[JOB] Profilo HW: {prof}")
         except ValueError as e:
-            state.emit_log(str(e), level="WARN")
+            state.emit_log(
+                f"[JOB] Profilo HW non trovato ({e}), uso default",
+                level="WARN",
+            )
 
         seq = state.enqueue_job({"slug": slug, "workflow": wf}, priority=5)
-        state.emit_log(f"[JOB] In coda workflow={wf} progetto={slug}")
-        log_app_system(f"Job in coda: {slug} workflow={wf}")
+        state.emit_log(f"[JOB] In coda — workflow={wf} progetto={slug} seq={seq}")
+
+        from engine.interaction_logger import log_app_system
+
+        log_app_system(f"Job accodato: {slug} workflow={wf}")
+
         _ensure_worker()
+
         return {
             "project": slug,
             "workflow": wf,
@@ -149,11 +196,17 @@ def start_job(*, slug: str, workflow: str | None = None) -> dict[str, Any]:
 def _run_job_worker(slug: str, workflow: str) -> None:
     state = get_orchestrator_state()
 
-    try:
-        router = get_model_router()
-        task = "reasoning" if workflow == "gap_analysis" else "summary"
-        model = router.apply_model_for_task(task)
-        state.emit_log(f"[JOB] Modello ({task}): {model}")
+    if workflow not in _SKIP_LM_WORKFLOWS:
+        try:
+            router = get_model_router()
+            task = "reasoning" if workflow == "gap_analysis" else "summary"
+            model = router.apply_model_for_task(task)
+            state.emit_log(f"[JOB] Modello ({task}): {model}")
+        except Exception as e:
+            state.emit_log(
+                f"[JOB] Model router: {e} — continuo senza routing",
+                level="WARN",
+            )
 
         require_allm = workflow == "gap_analysis"
         try:
@@ -162,54 +215,113 @@ def _run_job_worker(slug: str, workflow: str) -> None:
                 force_refresh=False,
             )
         except Exception as e:
-            state.emit_log(f"[JOB] Preflight: {e}", level="WARN")
-            if workflow == "gap_analysis":
-                if state.current_job:
-                    state.current_job["status"] = "failed"
-                return
+            err = f"Preflight fallito: {e}"
+            state.emit_log(f"[JOB] {err}", level="ERROR")
+            if state.current_job:
+                state.current_job["status"] = "failed"
+                state.current_job["error"] = err
+            return
 
+    try:
         if workflow in ("ingest", "sliding_window"):
             _run_ingest_job(slug)
         elif workflow == "gap_analysis":
             _run_gap_job(slug)
+        elif workflow == "test_workflow":
+            _run_test_job(slug)
         else:
-            state.emit_log(f"[JOB] Workflow sconosciuto: {workflow}", level="ERROR")
-            if state.current_job:
-                state.current_job["status"] = "failed"
-            return
-
-        if state.stop_event.is_set():
-            if state.current_job:
-                state.current_job["status"] = "stopped"
-            return
-
+            _run_plugin_workflow(slug, workflow)
+    except InterruptedError:
+        state.emit_log(f"[JOB] Interrotto da kill switch su {slug}", level="WARN")
         if state.current_job:
-            state.current_job["status"] = "completed"
-        state.emit_log(f"[JOB] Completato progetto={slug}")
+            state.current_job["status"] = "stopped"
+        return
     except Exception as e:
-        logger.exception("Job fallito")
-        state.emit_log(f"[JOB] Errore: {e}", level="ERROR")
+        logger.exception("Workflow %s fallito per %s", workflow, slug)
+        state.emit_log(f"[JOB] ✗ Workflow fallito: {e}", level="ERROR")
         if state.current_job:
             state.current_job["status"] = "failed"
-    finally:
-        if state.current_job and state.current_job.get("status") == "running":
+            state.current_job["error"] = str(e)[:300]
+        return
+
+    if not state.stop_event.is_set():
+        if state.current_job:
             state.current_job["status"] = "completed"
-        state.current_job = None
+        state.emit_log(f"[JOB] Completato: {slug}")
+
+
+def _run_test_job(slug: str) -> None:
+    """Workflow di test: 3 cicli da 1s, nessuna chiamata LLM."""
+    state = get_orchestrator_state()
+    if state.current_job:
+        state.current_job["files_total"] = 3
+
+    for i in range(1, 4):
+        if state.stop_event.is_set():
+            raise InterruptedError("test_workflow interrotto")
+        state.emit_log(f"[TEST] Step {i}/3")
+        if state.current_job:
+            state.current_job["files_completed"] = i
+        time.sleep(1.0)
+
+    state.emit_log("[TEST] Test workflow completato senza LLM")
+
+
+def _run_plugin_workflow(slug: str, workflow: str) -> None:
+    """Esegue workflow dal registro WorkflowRunner."""
+    from engine.workflow_runner import WorkflowRunner
+
+    state = get_orchestrator_state()
+    runner = WorkflowRunner()
+    wf_instance = runner.get_workflow(workflow)
+    if wf_instance is None:
+        raise ValueError(f"Workflow sconosciuto: {workflow!r}")
+
+    ctx: dict[str, Any] = {
+        "slug": slug,
+        "stop_event": state.stop_event,
+        "log_fn": lambda m: state.emit_log(m),
+    }
+    ingest_root = ingest_dir(slug)
+    files = [
+        p
+        for p in sorted(ingest_root.iterdir())
+        if p.is_file() and not p.name.startswith(".")
+    ]
+    if not files:
+        state.emit_log(
+            "[JOB] Nessun file in 01_INGEST per plugin workflow",
+            level="WARN",
+        )
+        return
+
+    if state.current_job:
+        state.current_job["files_total"] = len(files)
+
+    for src in files:
+        if state.stop_event.is_set():
+            raise InterruptedError(f"Plugin {workflow} interrotto")
+        if state.current_job:
+            state.current_job["current_file"] = src.name
+        wf_instance.process_file(src, ctx)
+        if state.current_job:
+            state.current_job["files_completed"] = (
+                state.current_job.get("files_completed", 0) + 1
+            )
 
 
 def _run_gap_job(slug: str) -> None:
+    from workflows.gap_analysis import run_project_gap_analysis
+
     state = get_orchestrator_state()
     sources = list_ingest_sources(slug, skip_duplicates=True, skip_completed=False)
     if state.current_job:
         state.current_job["files_total"] = len(sources) or 1
 
-    def log_fn(msg: str, level: str = "INFO") -> None:
-        state.emit_log(msg, level=level)
-
     n = run_project_gap_analysis(
         slug,
         stop_event=state.stop_event,
-        log_fn=lambda m: log_fn(m),
+        log_fn=lambda m: state.emit_log(m),
     )
     if state.current_job:
         state.current_job["files_completed"] = n
@@ -219,6 +331,7 @@ def _run_ingest_job(slug: str) -> None:
     state = get_orchestrator_state()
     cooldown = get_cooldown_manager()
     sources = list_ingest_sources(slug)
+
     if not sources:
         state.emit_log(
             "[JOB] Nessun file nuovo in 01_INGEST — copia documenti e riavvia",
@@ -232,21 +345,17 @@ def _run_ingest_job(slug: str) -> None:
         state.current_job["files_total"] = len(sources)
 
     max_tokens = resolve_chunk_max_tokens()
-
-    def log_fn(msg: str) -> None:
-        state.emit_log(msg)
-
     ingest_root = ingest_dir(slug)
 
     for src in sources:
         if state.stop_event.is_set():
-            break
+            raise InterruptedError(f"Ingest interrotto su {src.name}")
 
         if state.current_job:
             state.current_job["current_file"] = src.name
 
         file_dir = ingest_root / src.stem
-        state.emit_log(f"[JOB] Ingest: {src.name}")
+        state.emit_log(f"[INGEST] Elaboro: {src.name}")
 
         try:
             sliding_window_analyze(
@@ -254,20 +363,23 @@ def _run_ingest_job(slug: str) -> None:
                 file_dir.resolve(),
                 llm_complete,
                 state.stop_event,
-                log_fn,
+                lambda m: state.emit_log(m),
                 max_tokens,
             )
             mark_ingest_file_done(slug, src)
             if state.current_job:
-                state.current_job["files_completed"] += 1
+                state.current_job["files_completed"] = (
+                    state.current_job.get("files_completed", 0) + 1
+                )
             cooldown.after_file(state.stop_event)
         except InterruptedError:
-            state.emit_log(f"[JOB] Interrotto su {src.name}", level="WARN")
-            break
+            raise
         except Exception as e:
             if state.current_job:
-                state.current_job["files_failed"] += 1
-            state.emit_log(f"[JOB] Fallito {src.name}: {e}", level="ERROR")
+                state.current_job["files_failed"] = (
+                    state.current_job.get("files_failed", 0) + 1
+                )
+            state.emit_log(f"[INGEST] Fallito {src.name}: {e}", level="ERROR")
 
     if state.current_job:
         state.current_job["current_file"] = None
