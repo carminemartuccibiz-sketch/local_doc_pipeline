@@ -1,0 +1,52 @@
+# Windows desktop build — PyInstaller artifact for Local AI Orchestrator
+# Target: windows-latest (primary deployment OS for this tool)
+# Trigger: releases and version tags (not every push — keeps Actions minutes low)
+
+name: Windows build
+
+on:
+  release:
+    types:
+      - published
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  pyinstaller:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies and PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      # Bundle app.py + ui/ (templates, static) into a windowed onedir dist/
+      # Semicolon separator is required for --add-data on Windows
+      - name: Build executable with PyInstaller
+        run: |
+          pyinstaller --noconfirm --onedir --windowed --add-data "ui;ui" app.py
+
+      # Upload dist/app/ folder for release assets or manual QA
+      - name: Upload PyInstaller artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: local-ai-orchestrator-windows
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30

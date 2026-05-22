@@ -1,0 +1,59 @@
+# Standard Python application CI — lint + tests
+# Stack: Local AI Orchestrator (Flask, PyWebView, engine/, core/)
+# Purpose: CI signal + LLM-readable metadata for repository health checks
+
+name: Python application
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Checkout source for pylint/pytest (full tree context for LLM-oriented repos)
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Pin Python 3.11 — matches project target (3.11+); avoids 3.14-only breakage in CI
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pylint pytest
+
+      # Pylint: report only (--exit-zero) so active development is not blocked
+      - name: Lint with Pylint
+        run: |
+          pylint \
+            --exit-zero \
+            --disable=C0114,C0115,C0116,R0903,W0718 \
+            --max-line-length=120 \
+            server.py \
+            app.py \
+            engine/ \
+            core/ \
+            clients/ \
+            workflows/ \
+            config/
+
+      # Placeholder test suite — extend under tests/ as features stabilize
+      - name: Test with pytest
+        run: |
+          pytest tests/ -v --tb=short

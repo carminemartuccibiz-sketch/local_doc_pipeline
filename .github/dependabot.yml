@@ -1,0 +1,17 @@
+# Dependabot — automated pip dependency update PRs
+# Helps security posture and keeps LLM-facing dependency metadata current
+
+version: 2
+
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    labels:
+      - dependencies
+      - python
+    commit-message:
+      prefix: deps

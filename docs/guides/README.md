@@ -2,6 +2,14 @@
 
 Indice della documentazione di progetto e del blueprint Cursor.
 
+## CI/CD (GitHub Actions)
+
+| File | Ruolo |
+|------|--------|
+| `.github/workflows/python-app.yml` | Push/PR su `main`: pip, Pylint (non-blocking), pytest |
+| `.github/workflows/windows-build.yml` | Release o tag `v*`: build PyInstaller su Windows |
+| `.github/dependabot.yml` | Aggiornamenti pip settimanali |
+
 ## Meta-sviluppo (handoff IA sul repo software)
 
 | Risorsa | Uso |
