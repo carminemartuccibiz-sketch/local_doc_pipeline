@@ -51,30 +51,166 @@ def _orchestrator_state():
     return get_orchestrator_state()
 
 
+def _float_env(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def build_lm_http_timeout(*, read_seconds: float | None = None) -> httpx.Timeout:
+    """
+    Timeout granulari (GPT/Perplexity audit) — evita thread bloccati su LM Studio OOM/freeze.
+
+    - connect: fallisce rapido se LM Studio non risponde
+    - read: cap separato (default 120s) sotto LM_TIMEOUT_S
+    - timeout: tetto assoluto della richiesta (= LM_TIMEOUT_S)
+    """
+    ceiling = float(LM_TIMEOUT_S)
+    read = read_seconds if read_seconds is not None else min(
+        _float_env("LM_READ_TIMEOUT_S", 120.0),
+        ceiling,
+    )
+    return httpx.Timeout(
+        connect=_float_env("LM_CONNECT_TIMEOUT_S", 10.0),
+        read=read,
+        write=_float_env("LM_WRITE_TIMEOUT_S", 30.0),
+        pool=_float_env("LM_POOL_TIMEOUT_S", 30.0),
+        timeout=ceiling,
+    )
+
+
+_lm_pool_register_lock = threading.Lock()
+_pooled_lm_registered = False
+
+
+def _reset_pooled_lm_registration() -> None:
+    global _pooled_lm_registered
+    with _lm_pool_register_lock:
+        _pooled_lm_registered = False
+
+
+def _ensure_pooled_lm_registered(client: httpx.Client) -> None:
+    """Registra il client pool una sola volta per kill_all (Perplexity §1.1)."""
+    global _pooled_lm_registered
+    with _lm_pool_register_lock:
+        if _pooled_lm_registered or client.is_closed:
+            return
+        _orchestrator_state().register_client(client)
+        _pooled_lm_registered = True
+
+
+def _close_client_absolutely(client: httpx.Client, *, owned: bool) -> None:
+    """Chiusura idempotente — solo client ad-hoc; il pool si chiude in kill_all."""
+    if not owned:
+        return
+    state = _orchestrator_state()
+    state.unregister_client(client)
+    try:
+        if not client.is_closed:
+            client.close()
+    except Exception:
+        pass
+
+
+def release_lm_http_resources() -> None:
+    """
+    Invalida pool LM dopo timeout/OOM/kill (chiamabile da job_runner).
+    Il kill switch in orchestrator chiude anche i client registrati.
+    """
+    from clients.http_pool import close_all_http_clients
+
+    closed = close_all_http_clients()
+    _reset_pooled_lm_registration()
+    if closed:
+        logger.info("Pool HTTP LM invalidato (%d client)", closed)
+
+
+def abort_if_stop_requested() -> None:
+    """Cooperativo con Kill Switch — da chiamare tra step job lunghi."""
+    _check_kill_switch()
+
+
 def _check_kill_switch() -> None:
     if _orchestrator_state().stop_event.is_set():
         raise InterruptedError("Pipeline fermata dall'utente (Kill Switch)")
 
 
-@contextmanager
-def _managed_httpx_client(**kwargs: Any) -> Iterator[httpx.Client]:
-    """Client httpx registrato per kill switch (chiusura forzata in volo)."""
-    _check_kill_switch()
+def _normalize_client_kwargs(kwargs: dict[str, Any]) -> tuple[dict[str, Any], httpx.Timeout]:
+    timeout = kwargs.pop("timeout", None)
+    if timeout is None:
+        t = build_lm_http_timeout()
+    elif isinstance(timeout, httpx.Timeout):
+        t = timeout
+    else:
+        read = float(timeout)
+        t = build_lm_http_timeout(read_seconds=read)
+    kwargs["timeout"] = t
+    return kwargs, t
+
+
+def _lm_request_guarded(
+    client: httpx.Client,
+    method: str,
+    url: str,
+    **kwargs: Any,
+) -> httpx.Response:
+    """lm_request con timeout per-request e release pool su stall (OOM)."""
     state = _orchestrator_state()
-    client = httpx.Client(**kwargs)
-    state.register_client(client)
+    kwargs.setdefault("timeout", build_lm_http_timeout())
     try:
-        yield client
+        return lm_request(client, method, url, **kwargs)
+    except httpx.TimeoutException as e:
+        release_lm_http_resources()
+        raise RuntimeError(
+            f"LM Studio non ha risposto in tempo ({type(e).__name__}) — "
+            "possibile OOM/GPU freeze; riprova o riduci il batch"
+        ) from e
     except httpx.HTTPError as e:
         if state.stop_event.is_set():
+            release_lm_http_resources()
+            raise InterruptedError("Richiesta annullata da Kill Switch") from e
+        raise
+
+
+@contextmanager
+def _managed_httpx_client(**kwargs: Any) -> Iterator[httpx.Client]:
+    """
+    Client httpx — pool condiviso (non chiuso qui); ad-hoc solo con kwargs espliciti.
+
+    Il pool è registrato una volta su OrchestratorState per kill_all livello 2.
+    """
+    from clients.http_pool import HTTP_LIMITS, get_lm_client
+
+    _check_kill_switch()
+    owns_client = bool(kwargs)
+    kwargs, _ = _normalize_client_kwargs(dict(kwargs))
+
+    if owns_client:
+        headers = kwargs.pop("headers", None)
+        client = httpx.Client(
+            timeout=kwargs.pop("timeout", build_lm_http_timeout()),
+            limits=HTTP_LIMITS,
+            headers=headers,
+            **kwargs,
+        )
+        _orchestrator_state().register_client(client)
+    else:
+        client = get_lm_client()
+        _ensure_pooled_lm_registered(client)
+
+    try:
+        yield client
+    except httpx.TimeoutException:
+        release_lm_http_resources()
+        raise
+    except httpx.HTTPError as e:
+        if _orchestrator_state().stop_event.is_set():
+            release_lm_http_resources()
             raise InterruptedError("Richiesta annullata da Kill Switch") from e
         raise
     finally:
-        state.unregister_client(client)
-        try:
-            client.close()
-        except Exception:
-            pass
+        _close_client_absolutely(client, owned=owns_client)
 
 
 class AIBackend(str, Enum):
@@ -156,8 +292,14 @@ def discover_lm_studio_model(
 
     # 1) API nativa LM Studio — campo loaded_instances
     try:
-        with _managed_httpx_client(timeout=LM_TIMEOUT_S, headers=_auth_headers()) as client:
-            r = lm_request(client, "GET", native_url)
+        with _managed_httpx_client() as client:
+            r = _lm_request_guarded(
+                client,
+                "GET",
+                native_url,
+                headers=_auth_headers(),
+                timeout=build_lm_http_timeout(read_seconds=30.0),
+            )
             if r.status_code == 200:
                 payload = r.json()
                 items = payload if isinstance(payload, list) else payload.get("models") or payload.get("data") or []
@@ -195,8 +337,14 @@ def discover_lm_studio_model(
 
     # 2) OpenAI-compatible GET /v1/models
     try:
-        with _managed_httpx_client(timeout=LM_TIMEOUT_S, headers=_auth_headers()) as client:
-            r = lm_request(client, "GET", models_url)
+        with _managed_httpx_client() as client:
+            r = _lm_request_guarded(
+                client,
+                "GET",
+                models_url,
+                headers=_auth_headers(),
+                timeout=build_lm_http_timeout(read_seconds=30.0),
+            )
             r.raise_for_status()
             data = r.json()
     except httpx.HTTPError as e:
@@ -308,8 +456,14 @@ def _complete_openai_compatible(
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
-    with _managed_httpx_client(timeout=LM_TIMEOUT_S, headers=_auth_headers()) as client:
-        r = lm_request(client, "POST", url, json=payload)
+    with _managed_httpx_client() as client:
+        r = _lm_request_guarded(
+            client,
+            "POST",
+            url,
+            json=payload,
+            headers=_auth_headers(),
+        )
         r.raise_for_status()
         data = r.json()
     return data["choices"][0]["message"]["content"].strip()
@@ -332,8 +486,8 @@ def _complete_ollama(
         "stream": False,
         "options": {"temperature": temperature},
     }
-    with _managed_httpx_client(timeout=LM_TIMEOUT_S) as client:
-        r = lm_request(client, "POST", f"{base}/api/chat", json=payload)
+    with _managed_httpx_client() as client:
+        r = _lm_request_guarded(client, "POST", f"{base}/api/chat", json=payload)
         r.raise_for_status()
         return r.json()["message"]["content"].strip()
 
@@ -367,8 +521,14 @@ def _complete_lm_native(system_prompt: str, user_message: str, temperature: floa
         "temperature": temperature,
         "context_length": ctx,
     }
-    with _managed_httpx_client(timeout=LM_TIMEOUT_S, headers=_auth_headers()) as client:
-        r = lm_request(client, "POST", LM_NATIVE_CHAT_URL, json=payload)
+    with _managed_httpx_client() as client:
+        r = _lm_request_guarded(
+            client,
+            "POST",
+            LM_NATIVE_CHAT_URL,
+            json=payload,
+            headers=_auth_headers(),
+        )
         r.raise_for_status()
         data = r.json()
     text = parse_lm_native_response(data)
@@ -400,6 +560,26 @@ def llm_complete(
 
 
 def _llm_complete_unlocked(
+    *,
+    system_prompt: str,
+    user_message: str,
+    temperature: float = 0.1,
+    max_tokens: int = 4096,
+) -> str:
+    from engine.llm_watchdog import run_with_llm_watchdog
+
+    def _run() -> str:
+        return _llm_complete_unlocked_inner(
+            system_prompt=system_prompt,
+            user_message=user_message,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+
+    return run_with_llm_watchdog(_run, label="complete")
+
+
+def _llm_complete_unlocked_inner(
     *,
     system_prompt: str,
     user_message: str,
@@ -462,6 +642,11 @@ def _llm_complete_unlocked(
     if _prefer_native_lm_api(model):
         try:
             return _complete_lm_native(system_prompt, user_message, temperature)
+        except httpx.TimeoutException as e:
+            release_lm_http_resources()
+            raise RuntimeError(
+                "LM Studio timeout (native API) — possibile OOM/GPU freeze"
+            ) from e
         except httpx.HTTPStatusError as e:
             if e.response is not None and e.response.status_code == 500:
                 body = e.response.text[:200]

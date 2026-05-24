@@ -29,13 +29,9 @@ class CooldownManager:
         if stop_event is None:
             time.sleep(seconds)
             return
-        remaining = seconds
-        while remaining > 0:
-            if stop_event.is_set():
-                return
-            step = min(0.5, remaining)
-            time.sleep(step)
-            remaining -= step
+        # Audit GPT §1.5: wait interrompibile dal kill switch
+        if stop_event.wait(seconds):
+            return
 
     def after_llm_call(self, stop_event: Any) -> None:
         self._sleep_interruptible(self.lm_cooldown, stop_event)

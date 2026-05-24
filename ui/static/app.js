@@ -9,6 +9,9 @@
   let refreshTimer = null;
   let roleTargetPath = null;
   let eventSource = null;
+  let sseReconnectTimer = null;
+  let sseBackoffMs = 3000;
+  let sseStopped = false;
 
   async function api(path, options = {}) {
     const res = await fetch(path, {
@@ -20,20 +23,57 @@
     return data;
   }
 
-  function appendLog(entry) {
-    if (entry.heartbeat) return;
+  let logBuffer = [];
+  let logFlushScheduled = false;
+
+  function flushLogBuffer() {
+    logFlushScheduled = false;
+    if (!logBuffer.length) return;
     const el = $("log-stream");
-    const line = document.createElement("div");
-    line.className = `log-line ${entry.level || "INFO"}`;
-    const ts = entry.ts ? entry.ts.slice(11, 19) : "";
-    line.textContent = ts ? `[${ts}] ${entry.msg}` : entry.msg;
-    el.appendChild(line);
+    const frag = document.createDocumentFragment();
+    for (const entry of logBuffer) {
+      const line = document.createElement("div");
+      line.className = `log-line ${entry.level || "INFO"}`;
+      const ts = entry.ts ? entry.ts.slice(11, 19) : "";
+      line.textContent = ts ? `[${ts}] ${entry.msg}` : entry.msg;
+      frag.appendChild(line);
+    }
+    logBuffer = [];
+    el.appendChild(frag);
     el.scrollTop = el.scrollHeight;
   }
 
+  function appendLog(entry) {
+    if (entry.heartbeat) return;
+    logBuffer.push(entry);
+    if (!logFlushScheduled) {
+      logFlushScheduled = true;
+      requestAnimationFrame(flushLogBuffer);
+    }
+  }
+
+  function disconnectSSE(permanent = false) {
+    if (permanent) sseStopped = true;
+    if (sseReconnectTimer) {
+      clearTimeout(sseReconnectTimer);
+      sseReconnectTimer = null;
+    }
+    if (eventSource) {
+      eventSource.close();
+      eventSource = null;
+    }
+  }
+
   function connectSSE() {
-    if (eventSource) eventSource.close();
+    if (sseStopped) return;
+    if (eventSource) {
+      eventSource.close();
+      eventSource = null;
+    }
     eventSource = new EventSource("/api/logs/stream");
+    eventSource.onopen = () => {
+      sseBackoffMs = 3000;
+    };
     eventSource.onmessage = (ev) => {
       try {
         appendLog(JSON.parse(ev.data));
@@ -42,7 +82,17 @@
       }
     };
     eventSource.onerror = () => {
-      setTimeout(connectSSE, 3000);
+      if (eventSource) {
+        eventSource.close();
+        eventSource = null;
+      }
+      if (sseStopped || document.visibilityState === "hidden") {
+        return;
+      }
+      sseReconnectTimer = setTimeout(() => {
+        sseBackoffMs = Math.min(Math.round(sseBackoffMs * 1.5), 30000);
+        connectSSE();
+      }, sseBackoffMs);
     };
   }
 
@@ -342,7 +392,18 @@
     await loadProject(currentSlug);
   });
 
+  window.addEventListener("beforeunload", () => disconnectSSE(true));
+  window.addEventListener("pagehide", () => disconnectSSE(true));
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") {
+      disconnectSSE(false);
+    } else if (!sseStopped) {
+      connectSSE();
+    }
+  });
+
   async function init() {
+    sseStopped = false;
     connectSSE();
     await loadWorkflows();
     await loadProjects();

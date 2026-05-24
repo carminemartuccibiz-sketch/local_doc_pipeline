@@ -375,10 +375,13 @@ def fetch_sot_rag_context(
         f"(LAST DOCS canonico + documentazione vecchia baseline): "
         f"{raw_rel}\n{raw_excerpt[:2000]}"
     )
+    from config import GAP_RAG_SCORE_THRESHOLD
+
     results = client.vector_search(
         slug,
         query,
         top_n=top_n or GAP_RAG_TOP_N,
+        score_threshold=GAP_RAG_SCORE_THRESHOLD,
     )
     if not results:
         return ""

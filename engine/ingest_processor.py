@@ -2,7 +2,7 @@
 engine/ingest_processor.py — Sliding Window Context (Task 4 blueprint).
 
 Processo per file:
-  1. Lettura (extract_plain) + chunking con overlap fisico
+  1. Lettura (extract_plain) + chunking strutturale con overlap sliding window
   2. Salvataggio in projects/<slug>/01_INGEST/<stem>/
   3. Loop analisi LLM con condensato del chunk precedente
   4. Append su analysis.md chunk per chunk
@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
+import re
 import shutil
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -18,11 +20,29 @@ from pathlib import Path
 from typing import Callable
 
 from core.chunking import TextChunk, split_markdown_sections
+from core.context_budget import truncate_middle
 from core.converters import extract_plain
 from core.file_io import atomic_write_json
-from core.token_budget import count_tokens, resolve_chunk_max_tokens
+from core.token_budget import count_tokens, raw_budget_to_chars, resolve_chunk_max_tokens
 
 logger = logging.getLogger(__name__)
+
+# ─── Limiti sicurezza (audit GPT §2.3 — anti OOM / contesto LM) ───────────────
+
+INGEST_SAFETY_MARGIN = int(os.environ.get("INGEST_SAFETY_MARGIN", "128"))
+INGEST_MAX_CHUNKS = int(os.environ.get("INGEST_MAX_CHUNKS", "250"))
+INGEST_MAX_DOC_RATIO = float(os.environ.get("INGEST_MAX_DOC_RATIO", "0.55"))
+INGEST_ANALYZE_MAX_OUTPUT = int(os.environ.get("INGEST_ANALYZE_MAX_OUTPUT", "800"))
+INGEST_CONDENSE_MAX_OUTPUT = int(os.environ.get("INGEST_CONDENSE_MAX_OUTPUT", "200"))
+_CONVERTER_ERROR_MARKERS = ("_Errore", "_non installato", "_Nessun testo")
+
+
+class IngestReadError(ValueError):
+    """Lettura/conversione file fallita — non far crashare il worker senza messaggio."""
+
+
+class IngestBudgetError(ValueError):
+    """Documento o prompt troppo grande per il contesto LM — blocco pre-chiamata LLM."""
 
 # ─── Strutture dati ────────────────────────────────────────────────────────────
 
@@ -54,9 +74,261 @@ class FileIngestResult:
     final_summary: str = ""
 
 
-# ─── Chunking con overlap ──────────────────────────────────────────────────────
+@dataclass(slots=True)
+class IngestCallBudget:
+    """Budget dinamico per preflight prima di ogni chiamata LLM."""
+
+    model_hint: str
+    context_tokens: int
+    chunk_max_tokens: int
+    output_reserve: int
+    max_document_tokens: int
+    max_chunks: int
+
+
+# ─── Chunking strutturale + overlap (audit GPT §2.1 / Perplexity §3.1) ─────────
 
 OVERLAP_CHARS = 400  # ~100 token di sovrapposizione tra chunk adiacenti
+SLIDING_CONTEXT_CHUNKS = 2  # audit GPT §2.2 — rolling, non solo ultimo condensato
+_OVERLAP_PREFIX = "[...contesto dal blocco precedente...]\n"
+
+_FENCE_RE = re.compile(r"^```[^\n]*$", re.MULTILINE)
+_PARA_BREAK_RE = re.compile(r"\n\s*\n+")
+_LINE_BREAK_RE = re.compile(r"\n")
+_SENTENCE_BREAK_RE = re.compile(r"(?<=[.!?…])\s+(?=[A-ZÀ-ÿ0-9\"'`(])")
+
+
+@dataclass(frozen=True, slots=True)
+class _FenceSpan:
+    start: int
+    end: int
+
+
+def _fence_spans(text: str) -> list[_FenceSpan]:
+    """Intervalli ``` ... ``` (linee fence su righe dedicate)."""
+    lines = text.splitlines(keepends=True)
+    spans: list[_FenceSpan] = []
+    offset = 0
+    open_start: int | None = None
+    for line in lines:
+        stripped = line.strip()
+        if _FENCE_RE.match(stripped):
+            if open_start is None:
+                open_start = offset
+            else:
+                spans.append(_FenceSpan(open_start, offset + len(line)))
+                open_start = None
+        offset += len(line)
+    return spans
+
+
+def _position_in_fence(pos: int, spans: list[_FenceSpan]) -> bool:
+    return any(s.start <= pos < s.end for s in spans)
+
+
+def _snap_out_of_fence(pos: int, spans: list[_FenceSpan], *, forward: bool) -> int:
+    """Allinea pos fuori da un blocco fenced (non tagliare snippet di codice)."""
+    for span in spans:
+        if span.start < pos < span.end:
+            return span.end if forward else span.start
+    return pos
+
+
+def _collect_boundary_candidates(text: str, upto: int, spans: list[_FenceSpan]) -> list[int]:
+    """Punti di taglio sicuri in text[:upto] (esclusi interni fence)."""
+    upto = max(0, min(upto, len(text)))
+    if upto == 0:
+        return [0]
+    candidates: set[int] = {0, upto}
+    for m in _PARA_BREAK_RE.finditer(text, 0, upto):
+        candidates.add(m.end())
+    for m in _LINE_BREAK_RE.finditer(text, 0, upto):
+        if m.start() > 0:
+            candidates.add(m.start())
+    for m in _SENTENCE_BREAK_RE.finditer(text, 0, upto):
+        candidates.add(m.end())
+    for span in spans:
+        if span.start <= upto:
+            candidates.add(span.start)
+        if span.end <= upto:
+            candidates.add(span.end)
+    safe = [p for p in candidates if not _position_in_fence(p, spans)]
+    return sorted(set(safe))
+
+
+def _find_safe_start(text: str, rough_start: int, *, min_start: int = 0) -> int:
+    """
+    Allinea rough_start a un confine strutturale (paragrafo > riga > frase).
+    Non inizia a metà di un blocco ```.
+    """
+    spans = _fence_spans(text)
+    rough_start = max(min_start, min(rough_start, len(text)))
+    candidates = _collect_boundary_candidates(text, len(text), spans)
+    viable = [p for p in candidates if min_start <= p <= rough_start]
+    if not viable:
+        return _snap_out_of_fence(rough_start, spans, forward=True)
+    return viable[-1]
+
+
+def _normalize_overlap_segment(segment: str) -> str:
+    """Ripulisce overlap: niente fence aperti, niente righe spezzate."""
+    segment = segment.strip("\n")
+    if not segment:
+        return ""
+    spans = _fence_spans(segment)
+    if segment.count("```") % 2 == 1:
+        first = segment.find("```")
+        last = segment.rfind("```")
+        if first >= 0 and last > first:
+            segment = segment[first : last + 3]
+        elif first >= 0:
+            segment = segment[first:].lstrip("\n")
+            if segment.startswith("```"):
+                nl = segment.find("\n")
+                if nl >= 0:
+                    segment = segment[nl + 1 :]
+    if spans and _position_in_fence(0, spans):
+        segment = segment[_snap_out_of_fence(0, spans, forward=True) :]
+    return segment.strip()
+
+
+def _extract_structural_overlap(prev_text: str, max_chars: int) -> str:
+    """
+    Overlap dalla coda del chunk precedente, tagliato su confini sicuri
+    (paragrafo / frase / fence), non su numero fisso di caratteri grezzi.
+    """
+    if max_chars <= 0 or not prev_text.strip():
+        return ""
+    if len(prev_text) <= max_chars:
+        return _normalize_overlap_segment(prev_text)
+
+    rough = len(prev_text) - max_chars
+    min_start = max(0, len(prev_text) - max_chars * 2)
+    safe_start = _find_safe_start(prev_text, rough, min_start=min_start)
+    return _normalize_overlap_segment(prev_text[safe_start:])
+
+
+def _split_paragraphs(text: str) -> list[str]:
+    parts = [p.strip() for p in _PARA_BREAK_RE.split(text) if p.strip()]
+    return parts if parts else [text.strip()]
+
+
+def _pack_units_into_chunks(
+    units: list[str],
+    *,
+    max_tokens: int,
+    base_label: str,
+) -> list[TextChunk]:
+    """Accumula paragrafi (o frasi) fino al budget token."""
+    chunks: list[TextChunk] = []
+    buf: list[str] = []
+    buf_tokens = 0
+    part = 0
+
+    def flush() -> None:
+        nonlocal part, buf, buf_tokens
+        if not buf:
+            return
+        joined = "\n\n".join(buf)
+        label = base_label if part == 0 else f"{base_label} (part {part})"
+        chunks.append(
+            TextChunk(len(chunks), label[:80], joined, count_tokens(joined))
+        )
+        part += 1
+        buf = []
+        buf_tokens = 0
+
+    for unit in units:
+        unit_tokens = count_tokens(unit)
+        if unit_tokens > max_tokens:
+            flush()
+            chunks.extend(
+                _split_oversized_unit_by_sentences(unit, max_tokens=max_tokens, base_label=base_label)
+            )
+            continue
+        if buf_tokens + unit_tokens > max_tokens and buf:
+            flush()
+        buf.append(unit)
+        buf_tokens += unit_tokens
+    flush()
+    return chunks
+
+
+def _split_oversized_unit_by_sentences(
+    text: str,
+    *,
+    max_tokens: int,
+    base_label: str,
+) -> list[TextChunk]:
+    """Spezza testo lungo per frasi, mai per slice a caratteri fissi."""
+    sentences = [s.strip() for s in _SENTENCE_BREAK_RE.split(text) if s.strip()]
+    if not sentences:
+        spans = _fence_spans(text)
+        if spans:
+            out: list[TextChunk] = []
+            pos = 0
+            for i, span in enumerate(spans):
+                if span.start > pos:
+                    mid = text[pos:span.start].strip()
+                    if mid:
+                        out.extend(
+                            _pack_units_into_chunks([mid], max_tokens=max_tokens, base_label=base_label)
+                        )
+                block = text[span.start : span.end].strip()
+                if block:
+                    out.append(
+                        TextChunk(len(out), f"{base_label} (code {i + 1})", block, count_tokens(block))
+                    )
+                pos = span.end
+            if pos < len(text):
+                tail = text[pos:].strip()
+                if tail:
+                    out.extend(
+                        _pack_units_into_chunks([tail], max_tokens=max_tokens, base_label=base_label)
+                    )
+            return out if out else [TextChunk(0, base_label, text, count_tokens(text))]
+        return [TextChunk(0, f"{base_label} (full)", text, count_tokens(text))]
+
+    return _pack_units_into_chunks(sentences, max_tokens=max_tokens, base_label=base_label)
+
+
+def _split_text_at_safe_boundaries(
+    text: str,
+    *,
+    max_tokens: int,
+    base_label: str,
+) -> list[TextChunk]:
+    """Suddivisione paragrafo → frasi; rispetta blocchi ```."""
+    if count_tokens(text) <= max_tokens:
+        return [TextChunk(0, base_label[:80], text, count_tokens(text))]
+    return _pack_units_into_chunks(
+        _split_paragraphs(text),
+        max_tokens=max_tokens,
+        base_label=base_label,
+    )
+
+
+def _refine_chunks_to_token_budget(
+    chunks: list[TextChunk],
+    *,
+    max_tokens: int,
+) -> list[TextChunk]:
+    """Ri-splitta chunk troppo grandi usciti da split_markdown_sections."""
+    refined: list[TextChunk] = []
+    for chunk in chunks:
+        if count_tokens(chunk.text) <= max_tokens:
+            refined.append(chunk)
+        else:
+            refined.extend(
+                _split_text_at_safe_boundaries(
+                    chunk.text,
+                    max_tokens=max_tokens,
+                    base_label=chunk.label,
+                )
+            )
+    for i, c in enumerate(refined):
+        c.index = i
+    return refined
 
 ANALYZE_SYSTEM_PROMPT = """Sei un analista documentale. Ti viene fornito un frammento di documento
 (con eventuale contesto dal frammento precedente).
@@ -119,13 +391,16 @@ def _build_chunks_with_overlap(
     overlap_chars: int = OVERLAP_CHARS,
 ) -> tuple[list[TextChunk], list[ChunkMeta]]:
     """
-    Genera chunk logici (split su ##) e aggiunge overlap fisico
-    prendendo la coda del chunk precedente e incollandola all'inizio del successivo.
+    Chunking: sezioni Markdown (##) → paragrafi/frasi → overlap strutturale.
+    Nessun taglio a metà di ```, liste o frasi se evitabile.
     """
     base_chunks = split_markdown_sections(body, max_tokens=max_tokens)
+    base_chunks = _refine_chunks_to_token_budget(base_chunks, max_tokens=max_tokens)
 
     if not base_chunks:
-        base_chunks = [TextChunk(0, "full", body, count_tokens(body))]
+        base_chunks = _split_text_at_safe_boundaries(
+            body, max_tokens=max_tokens, base_label="full"
+        )
 
     if len(base_chunks) <= 1:
         chunk = base_chunks[0]
@@ -158,12 +433,9 @@ def _build_chunks_with_overlap(
         overlap_prev_chars = 0
         if i > 0:
             prev_text = base_chunks[i - 1].text
-            tail = (
-                prev_text[-overlap_chars:]
-                if len(prev_text) > overlap_chars
-                else prev_text
-            )
-            overlap_prefix = f"[...contesto dal blocco precedente...]\n{tail}\n\n"
+            tail = _extract_structural_overlap(prev_text, overlap_chars)
+            if tail:
+                overlap_prefix = f"{_OVERLAP_PREFIX}{tail}\n\n"
             overlap_prev_chars = len(tail)
 
         enriched_text = overlap_prefix + chunk.text
@@ -208,7 +480,12 @@ def _build_chunks_with_overlap(
 # ─── Sliding Window Loop ───────────────────────────────────────────────────────
 
 
-def _extract_condensed(analysis_text: str, *, llm_fn: Callable[..., str]) -> str:
+def _extract_condensed(
+    analysis_text: str,
+    *,
+    llm_fn: Callable[..., str],
+    user_message_override: str | None = None,
+) -> str:
     """Estrae il condensato dall'analisi. Prima parsing ## CONDENSATO, poi fallback LLM."""
     if "## CONDENSATO" in analysis_text:
         parts = analysis_text.split("## CONDENSATO", 1)
@@ -216,12 +493,211 @@ def _extract_condensed(analysis_text: str, *, llm_fn: Callable[..., str]) -> str
         if len(candidate) > 30:
             return candidate
 
+    user_msg = user_message_override if user_message_override is not None else analysis_text[:3000]
     return llm_fn(
         system_prompt=CONDENSE_SYSTEM_PROMPT,
-        user_message=analysis_text[:3000],
+        user_message=user_msg,
         temperature=0.05,
-        max_tokens=200,
+        max_tokens=INGEST_CONDENSE_MAX_OUTPUT,
     )
+
+
+def _log_ui(log_fn: Callable[[str], None] | None, msg: str, *, level: str = "INFO") -> None:
+    """Log verso logger + UI (prefisso ERROR/WARN per emit_log)."""
+    if level == "ERROR":
+        logger.error(msg)
+        ui = f"[INGEST][ERROR] {msg.removeprefix('[INGEST] ')}"
+    elif level == "WARN":
+        logger.warning(msg)
+        ui = f"[INGEST][WARN] {msg.removeprefix('[INGEST] ')}"
+    else:
+        logger.info(msg)
+        ui = msg
+    if log_fn:
+        log_fn(ui)
+
+
+def read_document_safe(file_path: Path, log_fn: Callable[[str], None] | None = None) -> str:
+    """
+    Lettura resiliente: dimensione max, encoding, file corrotti.
+    Errori chiari verso UI (IngestReadError) senza crash opaco del worker.
+    """
+    from config.runtime import MAX_FILE_BYTES
+
+    path = Path(file_path)
+    if not path.exists():
+        raise IngestReadError(f"File non trovato: {path}")
+    if not path.is_file():
+        raise IngestReadError(f"Percorso non è un file: {path}")
+
+    try:
+        size = path.stat().st_size
+    except OSError as e:
+        raise IngestReadError(f"Impossibile leggere metadati di {path.name}: {e}") from e
+
+    if size == 0:
+        raise IngestReadError(f"File vuoto: {path.name}")
+
+    if size > MAX_FILE_BYTES:
+        mib = size / (1024 * 1024)
+        cap_mib = MAX_FILE_BYTES / (1024 * 1024)
+        raise IngestReadError(
+            f"{path.name} troppo grande ({mib:.1f} MiB, max {cap_mib:.1f} MiB). "
+            "Suddividi il documento o alza PIPELINE_MAX_FILE_BYTES."
+        )
+
+    _log_ui(
+        log_fn,
+        f"[INGEST] Lettura: {path.name} ({size // 1024} KiB)",
+    )
+
+    try:
+        body = extract_plain(path)
+    except UnicodeDecodeError as e:
+        raise IngestReadError(
+            f"Encoding non UTF-8/CP1252 per {path.name} — converti in UTF-8 o .md"
+        ) from e
+    except PermissionError as e:
+        raise IngestReadError(f"Permesso negato su {path.name}") from e
+    except OSError as e:
+        raise IngestReadError(f"I/O fallita su {path.name}: {e}") from e
+    except MemoryError as e:
+        raise IngestReadError(
+            f"Memoria insufficiente leggendo {path.name} — file troppo grande per RAM"
+        ) from e
+    except Exception as e:
+        raise IngestReadError(
+            f"Estrazione testo fallita per {path.name}: {type(e).__name__}: {e}"
+        ) from e
+
+    stripped = body.strip()
+    if not stripped:
+        raise IngestReadError(f"Nessun testo estratto da {path.name}")
+
+    if any(stripped.startswith(m) or m in stripped[:120] for m in _CONVERTER_ERROR_MARKERS):
+        preview = stripped.replace("\n", " ")[:180]
+        raise IngestReadError(
+            f"Conversione non riuscita per {path.name}: {preview}"
+        )
+
+    return body
+
+
+def _resolve_ingest_call_budget(chunk_token_budget: int) -> IngestCallBudget:
+    """Budget dinamico dal modello LM attivo (GPT §2.3)."""
+    model_hint = "cl100k_base"
+    context = int(os.environ.get("GAP_MODEL_CONTEXT_TOKENS", "8192"))
+    output_reserve = INGEST_ANALYZE_MAX_OUTPUT
+
+    try:
+        from core.ai_tasks import get_session_lm_model
+        from core.token_budget import resolve_token_limits
+
+        model_hint = get_session_lm_model()
+        limits = resolve_token_limits(model_hint)
+        context = limits.context_tokens
+        output_reserve = min(INGEST_ANALYZE_MAX_OUTPUT, limits.response_reserve)
+    except Exception as e:
+        logger.debug("Budget ingest: fallback env (%s)", e)
+
+    max_doc = max(512, int(context * INGEST_MAX_DOC_RATIO))
+    return IngestCallBudget(
+        model_hint=model_hint,
+        context_tokens=context,
+        chunk_max_tokens=chunk_token_budget,
+        output_reserve=output_reserve,
+        max_document_tokens=max_doc,
+        max_chunks=INGEST_MAX_CHUNKS,
+    )
+
+
+def _preflight_whole_document(
+    body: str,
+    file_path: Path,
+    budget: IngestCallBudget,
+    log_fn: Callable[[str], None] | None,
+) -> int:
+    """Check pre-chunking: documento non deve saturare contesto / numero chunk."""
+    total = count_tokens(body, model_hint=budget.model_hint)
+    if total > budget.max_document_tokens:
+        raise IngestBudgetError(
+            f"{file_path.name}: ~{total} token totali (max {budget.max_document_tokens}). "
+            "Suddividi il file o usa un modello con contesto maggiore."
+        )
+
+    est_chunks = max(1, (total + budget.chunk_max_tokens - 1) // budget.chunk_max_tokens)
+    if est_chunks > budget.max_chunks:
+        raise IngestBudgetError(
+            f"{file_path.name}: ~{est_chunks} chunk stimati (max {budget.max_chunks}). "
+            "Riduci il file o aumenta GAP_CHUNK_MAX_TOKENS nel .env."
+        )
+
+    _log_ui(
+        log_fn,
+        f"[INGEST] Preflight OK: ~{total} tok, ~{est_chunks} chunk (contesto {budget.context_tokens})",
+    )
+    return total
+
+
+def _preflight_llm_payload(
+    *,
+    system_prompt: str,
+    user_message: str,
+    budget: IngestCallBudget,
+    log_fn: Callable[[str], None] | None,
+    label: str,
+    max_output_tokens: int,
+) -> str:
+    """Check pre-chiamata LLM: tronca il prompt se necessario, blocca se ancora OOM."""
+    sys_tok = count_tokens(system_prompt, model_hint=budget.model_hint)
+    usr_tok = count_tokens(user_message, model_hint=budget.model_hint)
+    max_input = (
+        budget.context_tokens
+        - sys_tok
+        - max_output_tokens
+        - INGEST_SAFETY_MARGIN
+    )
+
+    if max_input < 256:
+        raise IngestBudgetError(
+            f"{label}: budget input insufficiente ({max_input} tok liberi su "
+            f"{budget.context_tokens} contesto)"
+        )
+
+    if usr_tok > max_input:
+        _log_ui(
+            log_fn,
+            f"[INGEST] {label}: prompt ~{usr_tok} tok > {max_input}, troncamento sicuro",
+            level="WARN",
+        )
+        user_message, _ = truncate_middle(
+            user_message,
+            raw_budget_to_chars(max_input),
+            label,
+        )
+        usr_tok = count_tokens(user_message, model_hint=budget.model_hint)
+
+    if sys_tok + usr_tok + max_output_tokens + INGEST_SAFETY_MARGIN > budget.context_tokens:
+        raise IngestBudgetError(
+            f"{label}: ancora troppo grande dopo troncamento (~{usr_tok} tok input)"
+        )
+
+    return user_message
+
+
+def _resolve_ingest_chunk_tokens(requested: int) -> int:
+    """Budget chunk dinamico da modello attivo (audit GPT §2.3), fallback a requested."""
+    if requested != 1200:
+        return requested
+    try:
+        from core.ai_tasks import get_session_lm_model
+        from core.token_budget import resolve_chunk_max_tokens, resolve_token_limits
+
+        limits = resolve_token_limits(get_session_lm_model())
+        return resolve_chunk_max_tokens(limits)
+    except Exception as e:
+        logger.debug("Chunk budget dinamico non disponibile: %s", e)
+        return requested
 
 
 def _resolve_file_dir(
@@ -271,39 +747,68 @@ def sliding_window_analyze(
         project_ingest_dir=project_ingest_dir,
     )
 
-    def log(msg: str) -> None:
-        logger.info(msg)
-        if log_fn:
-            log_fn(msg)
+    chunk_token_budget = _resolve_ingest_chunk_tokens(max_tokens_per_chunk)
+    call_budget = _resolve_ingest_call_budget(chunk_token_budget)
 
-    # ── 1. Lettura e chunking ─────────────────────────────────────────────
-    log(f"[INGEST] Lettura: {file_path.name}")
-    body = extract_plain(file_path)
-    if not body.strip():
-        raise ValueError(f"Nessun testo estratto da {file_path}")
+    # ── 1. Lettura resiliente + preflight documento ─────────────────────────
+    try:
+        body = read_document_safe(file_path, log_fn)
+        _preflight_whole_document(body, file_path, call_budget, log_fn)
+    except (IngestReadError, IngestBudgetError) as e:
+        _log_ui(log_fn, str(e), level="ERROR")
+        raise
+    except Exception as e:
+        _log_ui(
+            log_fn,
+            f"Lettura preflight fallita per {file_path.name}: {e}",
+            level="ERROR",
+        )
+        raise IngestReadError(str(e)) from e
 
-    chunks, metas = _build_chunks_with_overlap(
-        body,
-        max_tokens=max_tokens_per_chunk,
-        overlap_chars=overlap_chars,
+    try:
+        chunks, metas = _build_chunks_with_overlap(
+            body,
+            max_tokens=chunk_token_budget,
+            overlap_chars=overlap_chars,
+        )
+    except Exception as e:
+        _log_ui(log_fn, f"Chunking fallito per {file_path.name}: {e}", level="ERROR")
+        raise IngestReadError(f"Chunking fallito: {e}") from e
+
+    if len(chunks) > call_budget.max_chunks:
+        raise IngestBudgetError(
+            f"{file_path.name}: {len(chunks)} chunk (max {call_budget.max_chunks})"
+        )
+
+    _log_ui(
+        log_fn,
+        f"[INGEST] {len(chunks)} chunk "
+        f"(budget {chunk_token_budget} tok, overlap {overlap_chars} char)",
     )
-    log(f"[INGEST] {len(chunks)} chunk (overlap {overlap_chars} char)")
 
     # ── 2. Cartella isolata per questo file ──────────────────────────────
-    resolved_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(file_path, resolved_dir / f"original{file_path.suffix}")
+    try:
+        resolved_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(file_path, resolved_dir / f"original{file_path.suffix}")
+    except OSError as e:
+        _log_ui(log_fn, f"Scrittura cartella ingest fallita: {e}", level="ERROR")
+        raise IngestReadError(str(e)) from e
 
     for chunk in chunks:
-        # Blueprint: chunk_001.txt (1-based); index in chunks.json resta 0-based
         chunk_path = resolved_dir / f"chunk_{chunk.index + 1:03d}.txt"
-        chunk_path.write_text(chunk.text, encoding="utf-8", newline="\n")
+        try:
+            chunk_path.write_text(chunk.text, encoding="utf-8", newline="\n")
+        except OSError as e:
+            _log_ui(log_fn, f"Scrittura {chunk_path.name} fallita: {e}", level="ERROR")
+            raise IngestReadError(str(e)) from e
 
     source_md5 = hashlib.md5(body.encode("utf-8", errors="replace")).hexdigest()
     chunks_json = {
         "source_file": file_path.name,
         "source_md5": source_md5,
         "chunked_at": _format_chunked_at(),
-        "chunk_strategy": "markdown_sections_overlap",
+        "chunk_strategy": "markdown_structural_overlap",
+        "chunk_token_budget": chunk_token_budget,
         "overlap_tokens": _overlap_tokens_estimate(
             overlap_chars, sample=body[:overlap_chars]
         ),
@@ -311,8 +816,12 @@ def sliding_window_analyze(
         "total_chunks": len(chunks),
         "chunks": [_chunk_meta_to_json(m, total=len(metas)) for m in metas],
     }
-    atomic_write_json(resolved_dir / "chunks.json", chunks_json)
-    log(f"[INGEST] Struttura salvata: {resolved_dir}")
+    try:
+        atomic_write_json(resolved_dir / "chunks.json", chunks_json)
+    except OSError as e:
+        _log_ui(log_fn, f"chunks.json non scritto: {e}", level="ERROR")
+        raise IngestReadError(str(e)) from e
+    _log_ui(log_fn, f"[INGEST] Struttura salvata: {resolved_dir}")
 
     if skip_llm:
         return FileIngestResult(
@@ -325,20 +834,28 @@ def sliding_window_analyze(
     # ── 3. Sliding Window Analysis ───────────────────────────────────────
     analysis_doc_path = resolved_dir / "analysis.md"
     analyses: list[ChunkAnalysis] = []
-    prev_condensed = ""
+    condensed_history: list[str] = []
+
+    analyze_out = min(INGEST_ANALYZE_MAX_OUTPUT, call_budget.output_reserve)
 
     for chunk in chunks:
         if stop_event.is_set():
-            log(f"[STOP] Interrotto a chunk {chunk.index}/{len(chunks)}")
+            _log_ui(log_fn, f"[STOP] Interrotto a chunk {chunk.index + 1}/{len(chunks)}")
             raise InterruptedError("Sliding window interrotto da Kill Switch")
 
-        log(f"[ANALYZE] Chunk {chunk.index + 1}/{len(chunks)}: {chunk.label}")
+        _log_ui(log_fn, f"[ANALYZE] Chunk {chunk.index + 1}/{len(chunks)}: {chunk.label}")
 
         context_block = ""
-        if prev_condensed:
+        if condensed_history:
+            recent = condensed_history[-SLIDING_CONTEXT_CHUNKS:]
+            parts = [
+                f"### Blocco precedente -{len(recent) - i}\n{c}"
+                for i, c in enumerate(recent)
+            ]
             context_block = (
-                f"\n---\n**Contesto dal blocco precedente (condensato):**\n"
-                f"{prev_condensed}\n---\n\n"
+                "\n---\n**Contesto rolling (ultimi blocchi analizzati):**\n"
+                + "\n".join(parts)
+                + "\n---\n\n"
             )
 
         user_msg = (
@@ -348,15 +865,65 @@ def sliding_window_analyze(
             f"## Testo del frammento\n\n{chunk.text}"
         )
 
-        raw_analysis = llm_fn(
-            system_prompt=ANALYZE_SYSTEM_PROMPT,
-            user_message=user_msg,
-            temperature=0.07,
-            max_tokens=800,
-        )
+        label = f"chunk {chunk.index + 1}/{len(chunks)}"
+        try:
+            user_msg = _preflight_llm_payload(
+                system_prompt=ANALYZE_SYSTEM_PROMPT,
+                user_message=user_msg,
+                budget=call_budget,
+                log_fn=log_fn,
+                label=label,
+                max_output_tokens=analyze_out,
+            )
+        except IngestBudgetError as e:
+            _log_ui(log_fn, str(e), level="ERROR")
+            raise
 
-        condensed = _extract_condensed(raw_analysis, llm_fn=llm_fn)
-        prev_condensed = condensed
+        try:
+            raw_analysis = llm_fn(
+                system_prompt=ANALYZE_SYSTEM_PROMPT,
+                user_message=user_msg,
+                temperature=0.07,
+                max_tokens=analyze_out,
+            )
+        except InterruptedError:
+            raise
+        except IngestBudgetError:
+            raise
+        except Exception as e:
+            err = f"Analisi {label} fallita: {e}"
+            _log_ui(log_fn, err, level="ERROR")
+            if "timeout" in str(e).lower() or "OOM" in str(e).upper():
+                raise IngestBudgetError(err) from e
+            raise IngestReadError(err) from e
+
+        try:
+            condense_msg = _preflight_llm_payload(
+                system_prompt=CONDENSE_SYSTEM_PROMPT,
+                user_message=raw_analysis[:3000],
+                budget=call_budget,
+                log_fn=log_fn,
+                label=f"condensato {label}",
+                max_output_tokens=INGEST_CONDENSE_MAX_OUTPUT,
+            )
+            condensed = _extract_condensed(
+                raw_analysis,
+                llm_fn=llm_fn,
+                user_message_override=condense_msg,
+            )
+        except IngestBudgetError:
+            condensed = raw_analysis[:400].strip() or "(condensato non disponibile)"
+        except Exception as e:
+            logger.warning("Condensato chunk %s fallback: %s", chunk.index, e)
+            _log_ui(
+                log_fn,
+                f"Condensato chunk {chunk.index + 1} fallback: {e}",
+                level="WARN",
+            )
+            condensed = raw_analysis[:400].strip() or "(condensato non disponibile)"
+        condensed_history.append(condensed)
+        if len(condensed_history) > SLIDING_CONTEXT_CHUNKS + 1:
+            condensed_history.pop(0)
 
         analyses.append(
             ChunkAnalysis(
@@ -382,17 +949,20 @@ def sliding_window_analyze(
                 )
             f.write(section)
 
-        log(
+        _log_ui(
+            log_fn,
             f"[ANALYZE] Chunk {chunk.index + 1} completato — "
-            f"condensato: {condensed[:80]}..."
+            f"condensato: {condensed[:80]}...",
         )
-        log(f"Chunk {chunk.index + 1}/{len(chunks)} completato — {chunk.label}")
 
         from engine.cooldown_manager import get_cooldown_manager
 
         get_cooldown_manager().after_chunk(stop_event)
 
-    log(f"[INGEST] File completato: {file_path.name} ({len(analyses)} chunk analizzati)")
+    _log_ui(
+        log_fn,
+        f"[INGEST] File completato: {file_path.name} ({len(analyses)} chunk analizzati)",
+    )
 
     return FileIngestResult(
         source_file=str(file_path),

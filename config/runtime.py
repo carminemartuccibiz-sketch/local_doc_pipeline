@@ -122,6 +122,9 @@ GAP_USE_ALLM_RAG: Final[bool] = os.environ.get("GAP_USE_ALLM_RAG", "true").lower
     "yes",
 )
 GAP_RAG_TOP_N: Final[int] = int(os.environ.get("GAP_RAG_TOP_N", "10"))
+GAP_RAG_SCORE_THRESHOLD: Final[float] = float(
+    os.environ.get("GAP_RAG_SCORE_THRESHOLD", "0.45")
+)
 
 
 def output_dir(source_root: Path) -> Path:

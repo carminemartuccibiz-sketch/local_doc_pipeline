@@ -14,10 +14,11 @@ import time
 
 
 def _start_flask() -> None:
-    from server import app as flask_app
     from config import UI_PORT
+    from engine.http_serve import serve_flask_app
+    from server import app as flask_app
 
-    flask_app.run(host="127.0.0.1", port=UI_PORT, debug=False, use_reloader=False, threaded=True)
+    serve_flask_app(flask_app, host="127.0.0.1", port=UI_PORT)
 
 
 def main() -> int:

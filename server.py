@@ -6,9 +6,10 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from queue import Empty
 
-from flask import Flask, Response, jsonify, render_template, request
+from flask import Flask, Response, jsonify, render_template, request, stream_with_context
 from flask_cors import CORS
 
 from config import UI_PORT, PROFILES, PROFILE_ALIASES
@@ -41,7 +42,47 @@ app = Flask(
     static_folder="ui/static",
     static_url_path="/static",
 )
-CORS(app)
+
+# CORS ristretto — solo UI locale (audit Perplexity §2.1)
+_ALLOWED_ORIGINS = [
+    f"http://127.0.0.1:{UI_PORT}",
+    f"http://localhost:{UI_PORT}",
+]
+CORS(
+    app,
+    resources={
+        r"/api/*": {
+            "origins": _ALLOWED_ORIGINS,
+            "supports_credentials": False,
+            "methods": ["GET", "POST", "OPTIONS"],
+            "allow_headers": ["Content-Type"],
+        }
+    },
+)
+
+SSE_HEARTBEAT_S = 15.0
+_sse_active_streams = 0
+
+
+@app.after_request
+def _security_headers(response: Response):
+    """Header difensivi per PyWebView / Flask su loopback (audit §2)."""
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    if request.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+    if not request.path.startswith("/api/logs/stream"):
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; "
+            "script-src 'self'; "
+            "style-src 'self' 'unsafe-inline'; "
+            "connect-src 'self'; "
+            "img-src 'self' data:; "
+            "frame-ancestors 'none'"
+        )
+    return response
 
 UI_PROFILES = [
     {"id": "eco", "label": "Eco (basso carico)"},
@@ -241,8 +282,9 @@ def api_jobs_status():
     è stato azzerato, così la UI può mostrare FAILED e abilitare RESET.
     """
     state = get_orchestrator_state()
-    job = state.current_job
-    last = state._last_job
+    job = state.get_current_job_snapshot()
+    with state._lock:
+        last = dict(state._last_job) if state._last_job else None
     displayed_job = job if job is not None else last
 
     return jsonify(
@@ -254,33 +296,81 @@ def api_jobs_status():
     )
 
 
+def _sse_client_disconnected() -> bool:
+    """Rileva chiusura connessione WSGI (browser/tab chiusa o refresh)."""
+    try:
+        if getattr(request, "is_disconnected", False):
+            return True
+        wsgi_input = request.environ.get("wsgi.input")
+        if wsgi_input is not None and getattr(wsgi_input, "closed", False):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _sse_yield(payload: str) -> str:
+    return f"data: {payload}\n\n"
+
+
 @app.get("/api/logs/stream")
 def logs_stream():
-    log_queue = get_orchestrator_state().log_stream
+    """
+    SSE log — heartbeat, stop su kill switch, uscita se client disconnette.
+    Evita zombie thread/worker (audit GPT §1.3, Perplexity §1.3).
+    """
+    global _sse_active_streams
+    state = get_orchestrator_state()
+    log_queue = state.log_stream
 
+    @stream_with_context
     def generate():
-        while True:
-            try:
-                msg = log_queue.get(timeout=0.3)
-                yield f"data: {json.dumps(msg, ensure_ascii=False)}\n\n"
-            except Empty:
-                yield 'data: {"heartbeat": true}\n\n'
+        global _sse_active_streams
+        _sse_active_streams += 1
+        last_ping = time.monotonic()
+        logger.debug("SSE stream opened (active=%d)", _sse_active_streams)
+        try:
+            while not state.stop_event.is_set():
+                if _sse_client_disconnected():
+                    logger.debug("SSE: client disconnected (environ)")
+                    break
+
+                try:
+                    entry = log_queue.get(timeout=1.0)
+                    line = _sse_yield(json.dumps(entry, ensure_ascii=False))
+                    yield line
+                except Empty:
+                    now = time.monotonic()
+                    if now - last_ping >= SSE_HEARTBEAT_S:
+                        last_ping = now
+                        yield ": keep-alive\n\n"
+                    continue
+        except GeneratorExit:
+            logger.debug("SSE: GeneratorExit (client chiuso)")
+        except (BrokenPipeError, ConnectionResetError, OSError) as exc:
+            logger.debug("SSE: connessione persa (%s)", exc)
+        finally:
+            _sse_active_streams = max(0, _sse_active_streams - 1)
+            logger.debug("SSE stream ended (active=%d)", _sse_active_streams)
 
     return Response(
         generate(),
         mimetype="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
+            "Cache-Control": "no-cache, no-store",
             "X-Accel-Buffering": "no",
             "Connection": "keep-alive",
+            "X-Content-Type-Options": "nosniff",
         },
     )
 
 
 def main() -> None:
+    from engine.http_serve import serve_flask_app
+
     PROJECTS_ROOT.mkdir(parents=True, exist_ok=True)
     logger.info("Local AI Orchestrator — http://127.0.0.1:%s", UI_PORT)
-    app.run(host="127.0.0.1", port=UI_PORT, debug=False, use_reloader=False, threaded=True)
+    serve_flask_app(app, host="127.0.0.1", port=UI_PORT)
 
 
 if __name__ == "__main__":

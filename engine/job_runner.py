@@ -14,8 +14,15 @@ import threading
 import time
 from typing import Any
 
+import httpx
+
 from config.hardware_profiles import PROFILE_ALIASES, PROFILES
-from core.ai_tasks import init_gap_analysis_session, llm_complete
+from core.ai_tasks import (
+    abort_if_stop_requested,
+    init_gap_analysis_session,
+    llm_complete,
+    release_lm_http_resources,
+)
 from core.token_budget import resolve_chunk_max_tokens
 from engine.cooldown_manager import get_cooldown_manager
 from engine.ingest_processor import sliding_window_analyze
@@ -89,21 +96,26 @@ def _ensure_worker() -> None:
 
 def _persist_last_job_result(state) -> None:
     """Conserva l'ultimo risultato per /api/jobs/status (Task 3: last_job / _last_job)."""
-    if state.current_job:
-        state._last_job = dict(state.current_job)
+    snap = state.get_current_job_snapshot()
+    if snap:
+        with state._lock:
+            state._last_job = snap
     # Se current_job è già None (es. kill_all), non cancellare last_job impostato da STOP.
 
 
 def _job_worker_loop() -> None:
+    """
+    Loop worker job. WARNING: non chiamare is_job_running() qui — deadlock con qsize().
+    """
     while True:
         state = get_orchestrator_state()
 
         if state.stop_event.is_set():
-            time.sleep(0.3)
+            state.stop_event.wait(0.3)
             continue
 
         if _worker_busy(state):
-            time.sleep(0.2)
+            state.stop_event.wait(0.2)
             continue
 
         payload = state.job_queue.get(timeout=0.5)
@@ -116,29 +128,42 @@ def _job_worker_loop() -> None:
             logger.warning("Payload senza slug, skip")
             continue
 
-        state.current_job = {
-            "project": slug,
-            "workflow": workflow,
-            "status": "running",
-            "files_total": 0,
-            "files_completed": 0,
-            "files_failed": 0,
-            "current_file": None,
-            "error": None,
-        }
+        state.init_current_job(
+            project=slug,
+            workflow=workflow,
+            status="running",
+            files_total=0,
+            files_completed=0,
+            files_failed=0,
+            current_file=None,
+            error=None,
+            outputs_written=[],
+        )
         state.emit_log(f"[JOB] ▶ Avvio workflow={workflow} progetto={slug}")
 
         try:
             _run_job_worker(slug, workflow)
+        except InterruptedError:
+            state.emit_log(f"[JOB] Interrotto (kill switch) su {slug}", level="WARN")
+            release_lm_http_resources()
+            state.update_current_job(status="stopped")
+        except httpx.TimeoutException as e:
+            logger.exception("Job worker: timeout HTTP per %s", slug)
+            release_lm_http_resources()
+            state.emit_log(
+                f"[JOB] Timeout LM Studio — possibile OOM: {e}",
+                level="ERROR",
+            )
+            state.update_current_job(status="failed", error=str(e)[:300])
         except Exception as e:
             logger.exception("Job worker: errore non gestito per %s", slug)
+            if "timeout" in str(e).lower() or "OOM" in str(e):
+                release_lm_http_resources()
             state.emit_log(f"[JOB] Errore critico: {e}", level="ERROR")
-            if state.current_job:
-                state.current_job["status"] = "failed"
-                state.current_job["error"] = str(e)[:300]
+            state.update_current_job(status="failed", error=str(e)[:300])
 
         _persist_last_job_result(state)
-        state.current_job = None
+        state.clear_current_job()
 
 
 def start_job(*, slug: str, workflow: str | None = None) -> dict[str, Any]:
@@ -195,6 +220,7 @@ def start_job(*, slug: str, workflow: str | None = None) -> dict[str, Any]:
 
 def _run_job_worker(slug: str, workflow: str) -> None:
     state = get_orchestrator_state()
+    abort_if_stop_requested()
 
     if workflow not in _SKIP_LM_WORKFLOWS:
         try:
@@ -209,17 +235,22 @@ def _run_job_worker(slug: str, workflow: str) -> None:
             )
 
         require_allm = workflow == "gap_analysis"
+        abort_if_stop_requested()
         try:
             init_gap_analysis_session(
                 require_allm=require_allm,
                 force_refresh=False,
             )
+        except httpx.TimeoutException as e:
+            release_lm_http_resources()
+            err = f"Preflight timeout LM Studio: {e}"
+            state.emit_log(f"[JOB] {err}", level="ERROR")
+            state.update_current_job(status="failed", error=err[:300])
+            return
         except Exception as e:
             err = f"Preflight fallito: {e}"
             state.emit_log(f"[JOB] {err}", level="ERROR")
-            if state.current_job:
-                state.current_job["status"] = "failed"
-                state.current_job["error"] = err
+            state.update_current_job(status="failed", error=err)
             return
 
     try:
@@ -232,37 +263,41 @@ def _run_job_worker(slug: str, workflow: str) -> None:
         else:
             _run_plugin_workflow(slug, workflow)
     except InterruptedError:
+        release_lm_http_resources()
         state.emit_log(f"[JOB] Interrotto da kill switch su {slug}", level="WARN")
-        if state.current_job:
-            state.current_job["status"] = "stopped"
+        state.update_current_job(status="stopped")
+        return
+    except httpx.TimeoutException as e:
+        release_lm_http_resources()
+        logger.exception("Workflow %s timeout per %s", workflow, slug)
+        state.emit_log(f"[JOB] ✗ Timeout LM Studio: {e}", level="ERROR")
+        state.update_current_job(status="failed", error=str(e)[:300])
         return
     except Exception as e:
         logger.exception("Workflow %s fallito per %s", workflow, slug)
+        if isinstance(e, RuntimeError) and "timeout" in str(e).lower():
+            release_lm_http_resources()
         state.emit_log(f"[JOB] ✗ Workflow fallito: {e}", level="ERROR")
-        if state.current_job:
-            state.current_job["status"] = "failed"
-            state.current_job["error"] = str(e)[:300]
+        state.update_current_job(status="failed", error=str(e)[:300])
         return
 
     if not state.stop_event.is_set():
-        if state.current_job:
-            state.current_job["status"] = "completed"
+        state.update_current_job(status="completed")
         state.emit_log(f"[JOB] Completato: {slug}")
 
 
 def _run_test_job(slug: str) -> None:
     """Workflow di test: 3 cicli da 1s, nessuna chiamata LLM."""
     state = get_orchestrator_state()
-    if state.current_job:
-        state.current_job["files_total"] = 3
+    state.update_current_job(files_total=3)
 
     for i in range(1, 4):
         if state.stop_event.is_set():
             raise InterruptedError("test_workflow interrotto")
         state.emit_log(f"[TEST] Step {i}/3")
-        if state.current_job:
-            state.current_job["files_completed"] = i
-        time.sleep(1.0)
+        state.update_current_job(files_completed=i)
+        if state.stop_event.wait(1.0):
+            raise InterruptedError("test_workflow interrotto")
 
     state.emit_log("[TEST] Test workflow completato senza LLM")
 
@@ -280,6 +315,7 @@ def _run_plugin_workflow(slug: str, workflow: str) -> None:
     ctx: dict[str, Any] = {
         "slug": slug,
         "stop_event": state.stop_event,
+        "orchestrator": state,
         "log_fn": lambda m: state.emit_log(m),
     }
     ingest_root = ingest_dir(slug)
@@ -295,19 +331,14 @@ def _run_plugin_workflow(slug: str, workflow: str) -> None:
         )
         return
 
-    if state.current_job:
-        state.current_job["files_total"] = len(files)
+    state.update_current_job(files_total=len(files))
 
     for src in files:
         if state.stop_event.is_set():
             raise InterruptedError(f"Plugin {workflow} interrotto")
-        if state.current_job:
-            state.current_job["current_file"] = src.name
+        state.update_current_job(current_file=src.name)
         wf_instance.process_file(src, ctx)
-        if state.current_job:
-            state.current_job["files_completed"] = (
-                state.current_job.get("files_completed", 0) + 1
-            )
+        state.bump_files_completed()
 
 
 def _run_gap_job(slug: str) -> None:
@@ -315,16 +346,14 @@ def _run_gap_job(slug: str) -> None:
 
     state = get_orchestrator_state()
     sources = list_ingest_sources(slug, skip_duplicates=True, skip_completed=False)
-    if state.current_job:
-        state.current_job["files_total"] = len(sources) or 1
+    state.update_current_job(files_total=len(sources) or 1)
 
     n = run_project_gap_analysis(
         slug,
         stop_event=state.stop_event,
         log_fn=lambda m: state.emit_log(m),
     )
-    if state.current_job:
-        state.current_job["files_completed"] = n
+    state.update_current_job(files_completed=n)
 
 
 def _run_ingest_job(slug: str) -> None:
@@ -337,12 +366,10 @@ def _run_ingest_job(slug: str) -> None:
             "[JOB] Nessun file nuovo in 01_INGEST — copia documenti e riavvia",
             level="WARN",
         )
-        if state.current_job:
-            state.current_job["files_total"] = 0
+        state.update_current_job(files_total=0)
         return
 
-    if state.current_job:
-        state.current_job["files_total"] = len(sources)
+    state.update_current_job(files_total=len(sources))
 
     max_tokens = resolve_chunk_max_tokens()
     ingest_root = ingest_dir(slug)
@@ -351,8 +378,7 @@ def _run_ingest_job(slug: str) -> None:
         if state.stop_event.is_set():
             raise InterruptedError(f"Ingest interrotto su {src.name}")
 
-        if state.current_job:
-            state.current_job["current_file"] = src.name
+        state.update_current_job(current_file=src.name)
 
         file_dir = ingest_root / src.stem
         state.emit_log(f"[INGEST] Elaboro: {src.name}")
@@ -367,19 +393,12 @@ def _run_ingest_job(slug: str) -> None:
                 max_tokens,
             )
             mark_ingest_file_done(slug, src)
-            if state.current_job:
-                state.current_job["files_completed"] = (
-                    state.current_job.get("files_completed", 0) + 1
-                )
+            state.bump_files_completed()
             cooldown.after_file(state.stop_event)
         except InterruptedError:
             raise
         except Exception as e:
-            if state.current_job:
-                state.current_job["files_failed"] = (
-                    state.current_job.get("files_failed", 0) + 1
-                )
+            state.bump_files_failed()
             state.emit_log(f"[INGEST] Fallito {src.name}: {e}", level="ERROR")
 
-    if state.current_job:
-        state.current_job["current_file"] = None
+    state.update_current_job(current_file=None)

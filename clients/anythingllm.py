@@ -45,10 +45,12 @@ class AnythingLLMClient:
         return f"{self.base_url}/api{path}"
 
     def _http(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
-        """Richiesta HTTP tracciata (rolling log ultime 5 interazioni)."""
+        """Richiesta HTTP tracciata — client pool condiviso (audit §1.1)."""
+        from clients.http_pool import get_allm_client
+
         timeout = kwargs.pop("timeout", self.timeout)
-        with httpx.Client(timeout=timeout, headers=self._headers) as c:
-            return allm_request(c, method, url, **kwargs)
+        client = get_allm_client()
+        return allm_request(client, method, url, timeout=timeout, **kwargs)
 
     def health(self) -> bool:
         try:
@@ -286,8 +288,12 @@ class AnythingLLMClient:
         query: str,
         *,
         top_n: int = 12,
-        score_threshold: float = 0.15,
+        score_threshold: float | None = None,
     ) -> list[dict[str, Any]]:
+        if score_threshold is None:
+            from config import GAP_RAG_SCORE_THRESHOLD
+
+            score_threshold = GAP_RAG_SCORE_THRESHOLD
         payload = {
             "query": query,
             "topN": top_n,

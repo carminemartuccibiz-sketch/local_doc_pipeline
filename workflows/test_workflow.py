@@ -10,9 +10,13 @@ from pathlib import Path
 from typing import Any
 
 from workflows.base_workflow import BaseWorkflow
+from workflows.capabilities import WorkflowCapabilities
 
 
 class TestWorkflow(BaseWorkflow):
+    capabilities = WorkflowCapabilities(
+        requires_llm=False, requires_rag=False, supports_cancel=True
+    )
     """
     Workflow diagnostico: emette log ogni secondo per 3 step.
     Non richiede LM Studio, AnythingLLM o file in 01_INGEST.
