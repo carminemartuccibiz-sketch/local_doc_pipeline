@@ -19,6 +19,17 @@ from workflows.base_workflow import BaseWorkflow
 logger = logging.getLogger(__name__)
 
 
+def _gap_log(
+    log_fn: Callable[[str], None] | None,
+    msg: str,
+    level: str = "INFO",
+) -> None:
+    if not log_fn:
+        return
+    prefix = {"WARN": "[WARN] ", "ERROR": "[ERROR] "}.get(level, "")
+    log_fn(f"{prefix}{msg}")
+
+
 def resolve_project_sot_paths(slug: str) -> list[Path]:
     """SOT da file_roles (02_REFERENCE) o default repo documentazione."""
     project_dir = ingest_dir(slug).parent
@@ -87,16 +98,18 @@ def run_project_gap_analysis(
             cumulative=cumulative,
         )
         if ctx is None:
-            if log_fn:
-                log_fn("[GAP] Preflight fallito (LM Studio / AnythingLLM)", level="WARN")
+            _gap_log(
+                log_fn,
+                "[GAP] Preflight fallito (LM Studio / AnythingLLM)",
+                level="WARN",
+            )
             return 0
 
         total = 0
         round_n = 0
         while True:
             if stop_event is not None and stop_event.is_set():
-                if log_fn:
-                    log_fn("[GAP] Interrotto da kill switch", level="WARN")
+                _gap_log(log_fn, "[GAP] Interrotto da kill switch", level="WARN")
                 break
 
             ctx.st.load()

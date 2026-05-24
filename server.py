@@ -143,20 +143,10 @@ def api_projects_roles(slug: str):
 @app.get("/api/workflows")
 def api_workflows_list():
     """
-    FIX: restituisce {"workflows": [...]} (non array diretto).
-    app.js destruttura const { workflows } = await api("/api/workflows").
+    {"workflows": [{id, label, description, requires_llm, requires_rag, ...}]}
+    Plugin dal registro WorkflowRunner (label UI, non slug title-case).
     """
-    ingest_workflows = [
-        {"id": "ingest", "label": "Ingest (Sliding Window)"},
-        {"id": "test_workflow", "label": "Test (no LLM, 3 step)"},
-    ]
-    ingest_ids = {w["id"] for w in ingest_workflows}
-    plugin_workflows = [
-        {"id": k, "label": k.replace("_", " ").title()}
-        for k in WorkflowRunner.registered()
-        if k not in ingest_ids
-    ]
-    return jsonify({"workflows": ingest_workflows + plugin_workflows})
+    return jsonify({"workflows": WorkflowRunner.api_workflow_list()})
 
 
 @app.get("/api/models")

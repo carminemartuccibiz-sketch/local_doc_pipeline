@@ -65,15 +65,75 @@ class AnythingLLMClient:
             return {}
         r.raise_for_status()
         data = r.json()
-        return dict(data.get("workspace") or data or {})
+        ws = data.get("workspace") or data
+        if isinstance(ws, list):
+            for item in ws:
+                if isinstance(item, dict) and (
+                    item.get("slug") == slug or not ws
+                ):
+                    return dict(item)
+            return dict(ws[0]) if ws and isinstance(ws[0], dict) else {}
+        if isinstance(ws, dict):
+            return dict(ws)
+        return {}
+
+    def list_documents(self, workspace_slug: str) -> list[dict[str, Any]]:
+        """
+        Documenti già nel workspace (GET /v1/workspace/{slug} → documents[]).
+        Usato per delta sync prima di upload forzato (Task B7).
+        """
+        ws = self.get_workspace(workspace_slug)
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        def _append(doc: Any) -> None:
+            if not isinstance(doc, dict):
+                return
+            loc = str(doc.get("location") or doc.get("docpath") or doc.get("id") or "")
+            if loc and loc in seen:
+                return
+            if loc:
+                seen.add(loc)
+            out.append(doc)
+
+        for bucket in (
+            ws.get("documents"),
+            ws.get("files"),
+            ws.get("workspaceDocuments"),
+        ):
+            if isinstance(bucket, list):
+                for doc in bucket:
+                    _append(doc)
+
+        def _walk(obj: Any, depth: int = 0) -> None:
+            if depth > 6:
+                return
+            if isinstance(obj, dict):
+                if any(
+                    obj.get(k)
+                    for k in (
+                        "docSource",
+                        "title",
+                        "filename",
+                        "docpath",
+                        "location",
+                    )
+                ):
+                    _append(obj)
+                for v in obj.values():
+                    _walk(v, depth + 1)
+            elif isinstance(obj, list):
+                for item in obj:
+                    _walk(item, depth + 1)
+
+        _walk(ws)
+        return out
 
     def list_workspace_document_keys(self, workspace_slug: str) -> set[str]:
         """
         Chiavi documento già nel workspace (title / docSource / filename / docpath).
-        Best-effort: dipende dalla versione AnythingLLM.
         """
         keys: set[str] = set()
-        ws = self.get_workspace(workspace_slug)
 
         def _add(val: Any) -> None:
             if not val:
@@ -82,52 +142,21 @@ class AnythingLLMClient:
             keys.add(s)
             keys.add(Path(s).name)
 
-        for bucket in (
-            ws.get("documents"),
-            ws.get("files"),
-            ws.get("workspaceDocuments"),
-        ):
-            if not isinstance(bucket, list):
-                continue
-            for doc in bucket:
-                if not isinstance(doc, dict):
-                    continue
-                for field in (
-                    "docSource",
-                    "title",
-                    "filename",
-                    "name",
-                    "originalFilename",
-                    "docpath",
-                    "location",
-                ):
-                    _add(doc.get(field))
-                meta = doc.get("metadata")
-                if isinstance(meta, dict):
-                    for field in ("docSource", "title", "filename"):
-                        _add(meta.get(field))
-
-        # Alcune build annidano documenti in sotto-oggetti
-        def _walk(obj: Any, depth: int = 0) -> None:
-            if depth > 6:
-                return
-            if isinstance(obj, dict):
-                for k, v in obj.items():
-                    if k in (
-                        "docSource",
-                        "title",
-                        "filename",
-                        "name",
-                        "docpath",
-                        "location",
-                    ):
-                        _add(v)
-                    _walk(v, depth + 1)
-            elif isinstance(obj, list):
-                for item in obj:
-                    _walk(item, depth + 1)
-
-        _walk(ws)
+        for doc in self.list_documents(workspace_slug):
+            for field in (
+                "docSource",
+                "title",
+                "filename",
+                "name",
+                "originalFilename",
+                "docpath",
+                "location",
+            ):
+                _add(doc.get(field))
+            meta = doc.get("metadata")
+            if isinstance(meta, dict):
+                for field in ("docSource", "title", "filename"):
+                    _add(meta.get(field))
         return keys
 
     def list_workspaces(self) -> list[dict[str, Any]]:

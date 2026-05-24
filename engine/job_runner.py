@@ -19,11 +19,12 @@ import httpx
 from config.hardware_profiles import PROFILE_ALIASES, PROFILES
 from core.ai_tasks import (
     abort_if_stop_requested,
+    get_session_lm_model,
     init_gap_analysis_session,
     llm_complete,
     release_lm_http_resources,
 )
-from core.token_budget import resolve_chunk_max_tokens
+from core.token_budget import resolve_chunk_max_tokens, resolve_token_limits
 from engine.cooldown_manager import get_cooldown_manager
 from engine.ingest_processor import sliding_window_analyze
 from engine.model_router import get_model_router
@@ -37,7 +38,7 @@ _UI_PROFILE_ALIASES = {
     "deep": "I9_2080TI_32GB",
 }
 
-_SKIP_LM_WORKFLOWS = frozenset({"test_workflow"})
+_SKIP_LM_WORKFLOWS = frozenset({"test_workflow", "v2_ingest_beta"})
 
 logger = logging.getLogger(__name__)
 
@@ -333,12 +334,14 @@ def _run_plugin_workflow(slug: str, workflow: str) -> None:
 
     state.update_current_job(files_total=len(files))
 
-    for src in files:
+    for file_index, src in enumerate(files):
         if state.stop_event.is_set():
             raise InterruptedError(f"Plugin {workflow} interrotto")
+        ctx["file_index"] = file_index
+        ctx["files_in_job"] = len(files)
         state.update_current_job(current_file=src.name)
         wf_instance.process_file(src, ctx)
-        state.bump_files_completed()
+        state.bump_files_completed(current_file=src.name)
 
 
 def _run_gap_job(slug: str) -> None:
@@ -359,7 +362,11 @@ def _run_gap_job(slug: str) -> None:
 def _run_ingest_job(slug: str) -> None:
     state = get_orchestrator_state()
     cooldown = get_cooldown_manager()
-    sources = list_ingest_sources(slug)
+    sources = list_ingest_sources(
+        slug,
+        skip_duplicates=True,
+        log_fn=lambda m: state.emit_log(m),
+    )
 
     if not sources:
         state.emit_log(
@@ -371,7 +378,11 @@ def _run_ingest_job(slug: str) -> None:
 
     state.update_current_job(files_total=len(sources))
 
-    max_tokens = resolve_chunk_max_tokens()
+    try:
+        limits = resolve_token_limits(get_session_lm_model())
+        max_tokens = resolve_chunk_max_tokens(limits)
+    except Exception:
+        max_tokens = 1200
     ingest_root = ingest_dir(slug)
 
     for src in sources:
@@ -386,11 +397,11 @@ def _run_ingest_job(slug: str) -> None:
         try:
             sliding_window_analyze(
                 src.resolve(),
-                file_dir.resolve(),
-                llm_complete,
-                state.stop_event,
-                lambda m: state.emit_log(m),
-                max_tokens,
+                file_dir=file_dir.resolve(),
+                llm_fn=llm_complete,
+                stop_event=state.stop_event,
+                log_fn=lambda m: state.emit_log(m),
+                max_tokens_per_chunk=max_tokens,
             )
             mark_ingest_file_done(slug, src)
             state.bump_files_completed()

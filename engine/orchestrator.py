@@ -88,6 +88,42 @@ class OrchestratorState:
                 return
             self.current_job.update(fields)
 
+    def update_phase_progress(
+        self,
+        *,
+        current_file: str,
+        phase_label: str,
+        phase_index: int,
+        phase_total: int,
+        file_index: int | None = None,
+    ) -> None:
+        """
+        Progresso intra-file per plugin workflow (LLM / save).
+        Imposta progress_percent per la barra UI senza incrementare files_completed.
+        """
+        phase_total = max(1, phase_total)
+        phase_index = max(1, min(phase_index, phase_total))
+        with self._lock:
+            if self.current_job is None:
+                return
+            files_total = int(self.current_job.get("files_total") or 0)
+            fi = (
+                file_index
+                if file_index is not None
+                else int(self.current_job.get("files_completed") or 0)
+            )
+            self.current_job["current_file"] = (
+                f"{current_file} — {phase_label} ({phase_index}/{phase_total})"
+            )
+            self.current_job["phase_index"] = phase_index
+            self.current_job["phase_total"] = phase_total
+            if files_total > 0:
+                effective = fi + (phase_index / phase_total)
+                self.current_job["progress_percent"] = min(
+                    99,
+                    int(round((effective / files_total) * 100)),
+                )
+
     def bump_files_completed(
         self,
         delta: int = 1,
@@ -104,6 +140,12 @@ class OrchestratorState:
                 self.current_job["current_file"] = current_file
             prev = int(self.current_job.get("files_completed") or 0)
             self.current_job["files_completed"] = max(0, prev + delta)
+            files_total = int(self.current_job.get("files_total") or 0)
+            if files_total > 0:
+                self.current_job["progress_percent"] = min(
+                    100,
+                    int(round((self.current_job["files_completed"] / files_total) * 100)),
+                )
 
     def bump_files_failed(self, delta: int = 1) -> None:
         with self._lock:

@@ -11,8 +11,13 @@ from workflows.base_workflow import BaseWorkflow
 from workflows.blog_post import BlogPostWorkflow
 from workflows.capabilities import WorkflowCapabilities
 from workflows.code_analysis import CodeAnalysisWorkflow
+from workflows.devblog import DevBlogWorkflow
+from workflows.doc_refactor import DocRefactorWorkflow
+from workflows.flow import FlowWorkflow
 from workflows.gap_analysis import GapAnalysisWorkflow
+from workflows.reflect import ReflectWorkflow
 from workflows.test_workflow import TestWorkflow
+from workflows.v2_multimodal_ingest import V2MultimodalIngestWorkflow
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +45,36 @@ _REGISTRY: dict[str, tuple[type[BaseWorkflow], str, str, WorkflowCapabilities]] 
         TestWorkflow,
         "Test (no LLM, 3 step)",
         "Workflow diagnostico — verifica START/STOP/SSE senza LM Studio",
+        WorkflowCapabilities(requires_llm=False, requires_rag=False, supports_cancel=True),
+    ),
+    "doc_refactor": (
+        DocRefactorWorkflow,
+        "Doc Refactor (2-fasi)",
+        "Estrazione JSON per chunk + sintesi Gap Report",
+        WorkflowCapabilities(requires_llm=True, requires_rag=True, supports_cancel=True),
+    ),
+    "flow": (
+        FlowWorkflow,
+        "Flow Orchestrator",
+        "Sequenza workflow da YAML in 04_MEMORY/flows/",
+        WorkflowCapabilities(requires_llm=True, requires_rag=False, supports_cancel=True),
+    ),
+    "devblog": (
+        DevBlogWorkflow,
+        "Dev Blog",
+        "Code analysis + blog post in cascata",
+        WorkflowCapabilities(requires_llm=True, requires_rag=False, supports_cancel=True),
+    ),
+    "reflect": (
+        ReflectWorkflow,
+        "Reflect / Review",
+        "Auto-review output workflow in 03_OUTPUT/reviews/",
+        WorkflowCapabilities(requires_llm=True, requires_rag=False, supports_cancel=True),
+    ),
+    "v2_ingest_beta": (
+        V2MultimodalIngestWorkflow,
+        "V2 Multimodal Ingest (beta)",
+        "PDF da 01_INGEST → 02_STAGING: estrazione fisica + chunk semantici (no LLM)",
         WorkflowCapabilities(requires_llm=False, requires_rag=False, supports_cancel=True),
     ),
 }
@@ -71,16 +106,42 @@ class WorkflowRunner:
         return sorted(_REGISTRY.keys())
 
     @staticmethod
-    def registered_with_meta() -> list[dict[str, str]]:
+    def registered_with_meta() -> list[dict[str, Any]]:
         """Lista completa con id/label/description/capabilities per la UI."""
-        out: list[dict[str, str]] = []
+        out: list[dict[str, Any]] = []
         for slug, (_, label, desc, caps) in sorted(_REGISTRY.items()):
-            row: dict[str, str] = {
-                "id": slug,
-                "label": label,
-                "description": desc,
-                "requires_llm": str(caps.requires_llm).lower(),
-                "requires_rag": str(caps.requires_rag).lower(),
-            }
-            out.append(row)
+            out.append(
+                {
+                    "id": slug,
+                    "label": label,
+                    "description": desc,
+                    "requires_llm": caps.requires_llm,
+                    "requires_rag": caps.requires_rag,
+                    "supports_cancel": caps.supports_cancel,
+                }
+            )
         return out
+
+    @staticmethod
+    def api_workflow_list() -> list[dict[str, Any]]:
+        """
+        Payload per GET /api/workflows: ingest built-in + plugin dal registro.
+        """
+        meta_by_id = {m["id"]: m for m in WorkflowRunner.registered_with_meta()}
+        workflows: list[dict[str, Any]] = [
+            {
+                "id": "ingest",
+                "label": "Ingest (Sliding Window)",
+                "description": "Sliding window su 01_INGEST → chunks + analysis.md",
+                "requires_llm": True,
+                "requires_rag": False,
+                "supports_cancel": True,
+            }
+        ]
+        if "test_workflow" in meta_by_id:
+            workflows.append(meta_by_id["test_workflow"])
+        skip = frozenset({"ingest", "test_workflow"})
+        for slug in WorkflowRunner.registered():
+            if slug not in skip:
+                workflows.append(meta_by_id[slug])
+        return workflows

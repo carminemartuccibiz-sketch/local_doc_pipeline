@@ -2,7 +2,7 @@
 
 Mappa architetturale per handoff tra sessioni IA. Le righe `↳ [🧠 STORICO AI]` sono aggiornate da `scripts/update_dev_router.py` leggendo `AI_DEV_SESSIONS/`.
 
-**Ultimo aggiornamento router:** 2026-05-22T19:09:47Z
+**Ultimo aggiornamento router:** 2026-05-24T19:11:07Z
 
 ---
 
@@ -85,7 +85,7 @@ Mappa architetturale per handoff tra sessioni IA. Le righe `↳ [🧠 STORICO AI
 - clients/anythingllm.py: REST workspace, upload, embeddings, vector-search.
 ↳ [🧠 STORICO AI]: Modificato da Cursor il 2026-05-22 [completed]. Next: Smoke UI+ingest; valutare semantic_diff workflow (audit §4). _(log: 20260522_gpt_audit_hardening.md)_
 ↳ [🧠 STORICO AI]: Modificato da Cursor il 2026-05-21 [completed]. Next: Smoke ingest+gap con LM Studio; opzionale LM_STALL_WATCHDOG_S=120 in .env. _(log: 20260521_2100_gpt_audit_fixes.md)_
-- clients/http_helpers.py: Wrap httpx → `interaction_logger`.
+- clients/http_helpers.py: Wrap httpx → `interaction_logger` (import lazy; costanti in `clients/http_trace.py`).
 
 ## config/
 

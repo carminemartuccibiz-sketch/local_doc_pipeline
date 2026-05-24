@@ -16,8 +16,10 @@ class BaseWorkflow(ABC):
         """
         Elabora un singolo file nel contesto del progetto attivo.
 
-        ctx tipico: slug, stop_event, log_fn, orchestrator (OrchestratorState).
-        Per salvare output in 03_OUTPUT usare engine.project_memory.save_workflow_output
-        con state=ctx.get("orchestrator"); bump_progress=False se il job_runner
-        incrementa già files_completed dopo process_file.
+        ctx tipico: slug, stop_event, log_fn, orchestrator (OrchestratorState),
+        file_index, files_in_job (impostati da job_runner).
+        Tra fasi LLM/save chiamare workflows.workflow_progress.report_phase (o
+        report_llm_start / report_save) per aggiornare progress_percent UI.
+        Per salvare output usare save_workflow_output con state=ctx["orchestrator"];
+        bump_progress=False — job_runner chiama bump_files_completed() a fine file.
         """

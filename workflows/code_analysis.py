@@ -13,6 +13,7 @@ from core.converters import _read_text
 from engine.project_memory import save_workflow_output
 from workflows.base_workflow import BaseWorkflow
 from workflows.capabilities import WorkflowCapabilities
+from workflows.workflow_progress import report_llm_start, report_phase, report_save
 
 WORKFLOW_ID = "code_analysis"
 OUTPUT_SUBDIR = "code_reviews"
@@ -83,15 +84,6 @@ Regole:
 - Non inventare file o moduli non presenti nel sorgente.
 - Non aggiungere testo meta (es. "Ecco il report richiesto").
 """
-
-
-def _log_phase(
-    log_fn: Callable[[str], None],
-    phase: int,
-    total: int,
-    message: str,
-) -> None:
-    log_fn(f"[CODE] Fase {phase}/{total} — {message}")
 
 
 def _guess_language(path: Path) -> str:
@@ -219,14 +211,23 @@ class CodeAnalysisWorkflow(BaseWorkflow):
                 raise InterruptedError(f"CodeAnalysisWorkflow interrotto {stage}")
 
         _check_stop("all'avvio")
-        _log_phase(
-            log_fn,
-            1,
-            total_phases,
-            f"Avvio code review su {file_path.name}",
+        report_phase(
+            ctx,
+            tag="CODE",
+            phase=1,
+            total=total_phases,
+            label=f"Avvio code review su {file_path.name}",
+            file_path=file_path,
         )
 
-        _log_phase(log_fn, 2, total_phases, "Lettura e scansione sorgente")
+        report_phase(
+            ctx,
+            tag="CODE",
+            phase=2,
+            total=total_phases,
+            label="Lettura e scansione sorgente",
+            file_path=file_path,
+        )
         try:
             raw_code = _read_source_code(file_path, log_fn)
         except (OSError, ValueError, FileNotFoundError) as e:
@@ -236,7 +237,14 @@ class CodeAnalysisWorkflow(BaseWorkflow):
         language = _guess_language(file_path)
         code = _prepare_source_code(file_path, raw_code, log_fn)
 
-        _log_phase(log_fn, 3, total_phases, "Preparazione prompt (3 sezioni)")
+        report_phase(
+            ctx,
+            tag="CODE",
+            phase=3,
+            total=total_phases,
+            label="Preparazione prompt (3 sezioni)",
+            file_path=file_path,
+        )
         user_message = _build_user_message(
             code,
             source_name=file_path.name,
@@ -245,11 +253,13 @@ class CodeAnalysisWorkflow(BaseWorkflow):
 
         _check_stop("prima della chiamata LLM")
         abort_if_stop_requested()
-        _log_phase(
-            log_fn,
-            4,
-            total_phases,
-            f"Code review LLM ({language}, max {CODE_LLM_MAX_OUTPUT} token output)",
+        report_llm_start(
+            ctx,
+            tag="CODE",
+            phase=4,
+            total=total_phases,
+            file_path=file_path,
+            detail=f"Code review LLM ({language})",
         )
 
         report_md = llm_complete(
@@ -267,7 +277,14 @@ class CodeAnalysisWorkflow(BaseWorkflow):
         abort_if_stop_requested()
         _verify_report_sections(report_md, log_fn)
 
-        _log_phase(log_fn, 5, total_phases, "Salvataggio report in 03_OUTPUT/code_reviews/")
+        report_save(
+            ctx,
+            tag="CODE",
+            phase=5,
+            total=total_phases,
+            file_path=file_path,
+            subdir=OUTPUT_SUBDIR,
+        )
         out_name = f"{file_path.stem}.code_review.md"
         header = (
             f"# Code review — `{file_path.name}`\n\n"

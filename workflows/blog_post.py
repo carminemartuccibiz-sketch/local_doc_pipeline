@@ -13,6 +13,7 @@ from engine.ingest_processor import IngestReadError, read_document_safe
 from engine.project_memory import save_workflow_output
 from workflows.base_workflow import BaseWorkflow
 from workflows.capabilities import WorkflowCapabilities
+from workflows.workflow_progress import report_llm_start, report_phase, report_save
 
 WORKFLOW_ID = "blog_post"
 OUTPUT_SUBDIR = "blog_posts"
@@ -99,11 +100,21 @@ class BlogPostWorkflow(BaseWorkflow):
                 log_fn(f"[BLOG] Kill switch attivo {stage} — {file_path.name}")
                 raise InterruptedError(f"BlogPostWorkflow interrotto {stage}")
 
+        total_phases = 3
         _check_stop("prima di iniziare")
-        log_fn(f"[BLOG] Lettura sorgente: {file_path.name}")
+        source_override = ctx.get("source_override")
+        read_path = Path(source_override) if source_override else file_path
+        report_phase(
+            ctx,
+            tag="BLOG",
+            phase=1,
+            total=total_phases,
+            label=f"Lettura sorgente: {read_path.name}",
+            file_path=file_path,
+        )
 
         try:
-            body = _prepare_source_text(file_path, log_fn)
+            body = _prepare_source_text(read_path, log_fn)
         except IngestReadError as e:
             log_fn(f"[BLOG] Lettura fallita: {e}")
             raise
@@ -112,7 +123,14 @@ class BlogPostWorkflow(BaseWorkflow):
 
         _check_stop("prima della chiamata LLM")
         abort_if_stop_requested()
-        log_fn(f"[BLOG] Invio a LLM: {file_path.name}")
+        report_llm_start(
+            ctx,
+            tag="BLOG",
+            phase=2,
+            total=total_phases,
+            file_path=file_path,
+            detail="Generazione articolo LLM",
+        )
 
         article_md = llm_complete(
             system_prompt=_SYSTEM_PROMPT,
@@ -127,6 +145,14 @@ class BlogPostWorkflow(BaseWorkflow):
         _check_stop("dopo la chiamata LLM")
         abort_if_stop_requested()
 
+        report_save(
+            ctx,
+            tag="BLOG",
+            phase=3,
+            total=total_phases,
+            file_path=file_path,
+            subdir=OUTPUT_SUBDIR,
+        )
         out_name = f"{file_path.stem}.md"
         out_path = save_workflow_output(
             slug,

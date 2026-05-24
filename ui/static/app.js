@@ -152,7 +152,12 @@
     $("stat-done").textContent = String(done);
     $("stat-total").textContent = String(total);
     $("stat-failed").textContent = String(failed);
-    const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+    let pct = 0;
+    if (typeof job.progress_percent === "number" && !Number.isNaN(job.progress_percent)) {
+      pct = Math.max(0, Math.min(100, Math.round(job.progress_percent)));
+    } else if (total > 0) {
+      pct = Math.round((done / total) * 100);
+    }
     $("progress-bar").style.width = `${pct}%`;
     $("current-file").textContent = job.current_file
       ? `In corso: ${job.current_file}`
@@ -203,12 +208,19 @@
     if (prev) sel.value = prev;
   }
 
+  function normalizeWorkflowList(data) {
+    const raw = Array.isArray(data) ? data : data?.workflows;
+    if (!Array.isArray(raw)) return [];
+    return raw.filter(
+      (w) => w && typeof w.id === "string" && w.id.trim().length > 0,
+    );
+  }
+
   async function loadWorkflows() {
+    const sel = $("workflow-select");
     try {
-      // FIX: il server ora restituisce { workflows: [...] }
       const data = await api("/api/workflows");
-      const list = Array.isArray(data) ? data : (data.workflows || []);
-      const sel = $("workflow-select");
+      const list = normalizeWorkflowList(data);
       sel.innerHTML = "";
       if (!list.length) {
         sel.innerHTML = '<option value="ingest">Ingest (default)</option>';
@@ -217,12 +229,27 @@
       list.forEach((w) => {
         const opt = document.createElement("option");
         opt.value = w.id;
-        opt.textContent = w.label || w.id;
+        opt.textContent = w.label || w.id.replace(/_/g, " ");
+        if (w.description) {
+          opt.title = w.description;
+        }
+        const flags = [];
+        if (w.requires_llm) flags.push("LLM");
+        if (w.requires_rag) flags.push("RAG");
+        if (flags.length) {
+          opt.textContent += ` (${flags.join("+")})`;
+        }
         sel.appendChild(opt);
       });
+      const required = ["code_analysis", "devblog", "doc_refactor"];
+      const ids = new Set(list.map((w) => w.id));
+      const missing = required.filter((id) => !ids.has(id));
+      if (missing.length) {
+        console.warn("[loadWorkflows] plugin mancanti in /api/workflows:", missing);
+      }
     } catch (e) {
       console.warn("[loadWorkflows] fallback:", e);
-      $("workflow-select").innerHTML = '<option value="ingest">Ingest</option>';
+      sel.innerHTML = '<option value="ingest">Ingest</option>';
     }
   }
 

@@ -90,3 +90,64 @@ def test_save_workflow_output_markdown_shortcut(tmp_path: Path, monkeypatch) -> 
     )
     body = path.read_text(encoding="utf-8")
     assert body.startswith("# Report")
+
+
+def test_setup_v2_staging_dirs_creates_document_tree(tmp_path: Path, monkeypatch) -> None:
+    import engine.project_memory as pm
+
+    slug = "v2-demo"
+    monkeypatch.setattr(pm, "PROJECTS_ROOT", tmp_path / "projects")
+
+    layout = pm.setup_v2_staging_dirs(slug, "doc-001-source.pdf")
+
+    assert layout.root.is_dir()
+    assert layout.root.name == "doc-001-source.pdf"
+    assert layout.original.is_dir()
+    assert layout.extracted_images.is_dir()
+    assert layout.extracted_text.is_dir()
+    assert layout.extracted_tables.is_dir()
+    assert layout.extracted_ocr.is_dir()
+    assert layout.extracted_metadata.is_dir()
+    assert layout.chunks.is_dir()
+    assert layout.enriched.is_dir()
+    assert layout.rolling_memory.is_dir()
+    assert layout.conflicts_unresolved.is_dir()
+    assert layout.conflicts_resolved.is_dir()
+    assert layout.audit.is_dir()
+    assert layout.map_json.is_file()
+    assert layout.conflict_log_json.is_file()
+
+    map_data = json.loads(layout.map_json.read_text(encoding="utf-8"))
+    assert map_data["document_id"] == "doc-001-source.pdf"
+    assert map_data["pipeline_version"] == "2.0"
+    assert "physical_assets" in map_data
+    assert "rolling_memory" in map_data
+
+
+def test_setup_v2_staging_dirs_sanitizes_document_id(tmp_path: Path, monkeypatch) -> None:
+    import engine.project_memory as pm
+
+    slug = "v2-sanitize"
+    monkeypatch.setattr(pm, "PROJECTS_ROOT", tmp_path / "projects")
+
+    layout = pm.setup_v2_staging_dirs(slug, "../../evil/id")
+    assert ".." not in layout.root.as_posix()
+    assert layout.root.name == "id"
+
+
+def test_setup_v2_project_layout_scaffold(tmp_path: Path, monkeypatch) -> None:
+    import engine.project_memory as pm
+
+    slug = "v2-layout"
+    monkeypatch.setattr(pm, "PROJECTS_ROOT", tmp_path / "projects")
+
+    paths = pm.setup_v2_project_layout(slug)
+
+    assert paths["project_meta"].is_dir()
+    assert paths["raw_incoming"].is_dir()
+    assert paths["raw_quarantine"].is_dir()
+    assert paths["staging"].is_dir()
+    assert paths["knowledge_canonical"].is_dir()
+    assert paths["output_reports"].is_dir()
+    assert paths["memory_semantic_memory"].is_file()
+    assert paths["log_ingestion"].is_file()

@@ -97,3 +97,31 @@ def resolve_chunk_min_section_tokens() -> int:
 def raw_budget_to_chars(token_budget: int) -> int:
     """Conversione conservativa per build_context_bundle legacy."""
     return token_budget * _CHARS_PER_TOKEN_FALLBACK
+
+
+def validate_request_budget(
+    *,
+    model_id: str,
+    system_prompt: str,
+    user_prompt: str,
+    memory: str = "",
+    rag: str = "",
+    reserved_output: int = 2048,
+) -> dict[str, int | bool]:
+    """Preflight: stima token totali vs contesto utilizzabile (~80% context - output)."""
+    limits = resolve_token_limits(model_id)
+    usable = int(limits.context_tokens * 0.80) - reserved_output
+    projected = (
+        count_tokens(system_prompt, model_hint=model_id)
+        + count_tokens(user_prompt, model_hint=model_id)
+        + count_tokens(memory, model_hint=model_id)
+        + count_tokens(rag, model_hint=model_id)
+        + reserved_output
+    )
+    overflow = max(0, projected - usable)
+    return {
+        "fits": projected < usable,
+        "projected": projected,
+        "usable": usable,
+        "overflow": overflow,
+    }

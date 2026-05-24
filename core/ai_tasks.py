@@ -28,7 +28,12 @@ from config import (
 )
 from core.context_budget import ContextBundle, build_context_bundle
 from core.report_metadata import build_gap_frontmatter, ensure_spec_document
-from core.token_budget import count_tokens
+from core.llm_errors import LLMFatalError, LLMRecoverableError, classify_llm_error
+from core.token_budget import (
+    count_tokens,
+    resolve_token_limits,
+    validate_request_budget,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -539,6 +544,99 @@ def _complete_lm_native(system_prompt: str, user_message: str, temperature: floa
     return text
 
 
+def parse_fallback_chain() -> list[str]:
+    raw = os.environ.get("LM_FALLBACK_CHAIN", "").strip()
+    if raw:
+        return [x.strip() for x in raw.split(",") if x.strip()]
+    try:
+        return [get_session_lm_model()]
+    except Exception:
+        return [LM_MODEL or LM_MODEL_FALLBACK or "local-model"]
+
+
+def _truncate_user_for_context(
+    *,
+    model: str,
+    system_prompt: str,
+    user_message: str,
+    max_output_tokens: int,
+    safety_margin: int = 128,
+) -> str:
+    limits = resolve_token_limits(model)
+    max_in = (
+        limits.context_tokens
+        - limits.response_reserve
+        - max_output_tokens
+        - safety_margin
+    )
+    est_in = count_tokens(system_prompt + user_message, model_hint=model)
+    if est_in <= max_in or max_in < 256:
+        return user_message
+    from core.context_budget import truncate_middle
+
+    user_message, _ = truncate_middle(
+        user_message,
+        max(256, max_in - count_tokens(system_prompt, model_hint=model))
+        * 4,
+        "prompt_utente",
+    )
+    logger.warning(
+        "Prompt ridotto per contesto LM (%d → budget ~%d token input)",
+        est_in,
+        max_in,
+    )
+    return user_message
+
+
+def smart_llm_complete(
+    *,
+    system_prompt: str,
+    user_message: str,
+    temperature: float = 0.1,
+    max_tokens: int = 4096,
+) -> str:
+    """Hierarchical model fallback — opt-in via LM_USE_SMART_FALLBACK."""
+    last_error: Exception | None = None
+    current_max = max_tokens
+    current_user = user_message
+    chain = parse_fallback_chain()
+
+    for model_id in chain:
+        try:
+            budget = validate_request_budget(
+                model_id=model_id,
+                system_prompt=system_prompt,
+                user_prompt=current_user,
+                reserved_output=current_max,
+            )
+            if not budget["fits"] and budget["usable"] > 0:
+                ratio = min(0.7, budget["usable"] / max(budget["projected"], 1))
+                current_user = current_user[: max(256, int(len(current_user) * ratio))]
+
+            prev = get_session_lm_model()
+            set_session_lm_model(model_id, persist_env=False)
+            try:
+                return _llm_complete_unlocked(
+                    system_prompt=system_prompt,
+                    user_message=current_user,
+                    temperature=temperature,
+                    max_tokens=current_max,
+                )
+            finally:
+                set_session_lm_model(prev, persist_env=False)
+
+        except Exception as e:
+            classified = classify_llm_error(e)
+            last_error = classified
+            logger.warning("smart_llm_complete fail model=%s: %s", model_id, classified)
+            if isinstance(classified, LLMFatalError):
+                raise classified from e
+            current_max = int(current_max * 0.7)
+            time.sleep(2)
+
+    raise RuntimeError(f"All fallback models failed: {last_error}")
+
+
 def llm_complete(
     *,
     system_prompt: str,
@@ -546,13 +644,22 @@ def llm_complete(
     temperature: float = 0.1,
     max_tokens: int = 4096,
 ) -> str:
-    with _llm_semaphore:
-        result = _llm_complete_unlocked(
-            system_prompt=system_prompt,
-            user_message=user_message,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
+    if os.environ.get("LM_USE_SMART_FALLBACK", "").lower() in ("1", "true", "yes"):
+        with _llm_semaphore:
+            result = smart_llm_complete(
+                system_prompt=system_prompt,
+                user_message=user_message,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+    else:
+        with _llm_semaphore:
+            result = _llm_complete_unlocked(
+                system_prompt=system_prompt,
+                user_message=user_message,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
     from engine.cooldown_manager import get_cooldown_manager
 
     get_cooldown_manager().after_llm_call(_orchestrator_state().stop_event)
@@ -620,24 +727,12 @@ def _llm_complete_unlocked_inner(
         int(os.environ.get("GAP_LM_MAX_OUTPUT", "2048")),
     )
 
-    est_in = count_tokens(system_prompt + user_message, model_hint=model)
-    ctx_cap = int(os.environ.get("LM_NATIVE_CONTEXT", "0") or "0") or int(
-        os.environ.get("GAP_MODEL_CONTEXT_TOKENS", "8192")
+    user_message = _truncate_user_for_context(
+        model=model,
+        system_prompt=system_prompt,
+        user_message=user_message,
+        max_output_tokens=safe_max,
     )
-    max_in = int(ctx_cap * 0.72) - safe_max
-    if est_in > max_in > 2000:
-        from core.context_budget import truncate_middle
-
-        user_message, _ = truncate_middle(
-            user_message,
-            max(2000, max_in - count_tokens(system_prompt, model_hint=model)),
-            "prompt_utente",
-        )
-        logger.warning(
-            "Prompt ridotto per contesto LM (%d → budget ~%d token input)",
-            est_in,
-            max_in,
-        )
 
     if _prefer_native_lm_api(model):
         try:

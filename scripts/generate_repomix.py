@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+DMIP_ROOT = REPO_ROOT.parent / "dmip"
 OUTPUT_PATH = REPO_ROOT / "_LLM_CONTEXT_DUMP.txt"
 ROOTPAM_PATH = REPO_ROOT / "ROOTPAM.md"
 ROUTER_SCRIPT = REPO_ROOT / "scripts" / "update_dev_router.py"
@@ -79,34 +80,47 @@ def should_include(path: Path) -> bool:
     return True
 
 
-def iter_source_files() -> list[Path]:
-    files: list[Path] = []
-    for path in sorted(REPO_ROOT.rglob("*")):
+def _iter_tree(root: Path, prefix: str) -> list[tuple[str, Path]]:
+    """(display_path, absolute_path) sotto root."""
+    out: list[tuple[str, Path]] = []
+    if not root.is_dir():
+        return out
+    for path in sorted(root.rglob("*")):
         if not path.is_file():
             continue
         try:
-            rel = path.relative_to(REPO_ROOT)
+            rel = path.relative_to(root)
         except ValueError:
-            continue
-        if rel == Path("ROOTPAM.md"):
             continue
         if not should_include(rel):
             continue
         if path.stat().st_size > MAX_FILE_BYTES:
             continue
-        files.append(rel)
+        display = f"{prefix}/{rel.as_posix()}" if prefix else rel.as_posix()
+        out.append((display, path))
+    return out
+
+
+def iter_source_files(*, include_dmip: bool = False) -> list[tuple[str, Path]]:
+    files: list[tuple[str, Path]] = []
+    for display, full in _iter_tree(REPO_ROOT, ""):
+        if display == "ROOTPAM.md":
+            continue
+        files.append((display, full))
+    if include_dmip:
+        for display, full in _iter_tree(DMIP_ROOT, "dmip"):
+            files.append((display, full))
     return files
 
 
-def read_chunk(rel: Path) -> str:
-    full = REPO_ROOT / rel
+def read_chunk(full: Path) -> str:
     try:
         return full.read_text(encoding="utf-8", errors="replace")
     except OSError as e:
         return f"[read error: {e}]\n"
 
 
-def build_dump() -> str:
+def build_dump(*, include_dmip: bool = False) -> str:
     run_router()
 
     parts: list[str] = []
@@ -115,6 +129,8 @@ def build_dump() -> str:
     parts.append("=" * 72)
     parts.append("DVAMOCLES Local AI Orchestrator — LLM CONTEXT DUMP")
     parts.append(f"Generated: {stamp}")
+    if include_dmip:
+        parts.append(f"DMIP: {DMIP_ROOT.as_posix()}")
     parts.append("=" * 72)
     parts.append("")
 
@@ -122,21 +138,30 @@ def build_dump() -> str:
         parts.append("=" * 72)
         parts.append("FILE: ROOTPAM.md (REPO MAP + AI DEV HISTORY)")
         parts.append("=" * 72)
-        parts.append(read_chunk(Path("ROOTPAM.md")))
+        parts.append(read_chunk(ROOTPAM_PATH))
         parts.append("")
 
-    for rel in iter_source_files():
+    for display, full in iter_source_files(include_dmip=include_dmip):
         parts.append("=" * 72)
-        parts.append(f"FILE: {rel.as_posix()}")
+        parts.append(f"FILE: {display}")
         parts.append("=" * 72)
-        parts.append(read_chunk(rel))
+        parts.append(read_chunk(full))
         parts.append("")
 
     return "\n".join(parts)
 
 
 def main() -> int:
-    dump = build_dump()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Genera _LLM_CONTEXT_DUMP.txt")
+    parser.add_argument(
+        "--include-dmip",
+        action="store_true",
+        help="Includi sorgenti da tools/dmip/ (sibling)",
+    )
+    args = parser.parse_args()
+    dump = build_dump(include_dmip=args.include_dmip)
     OUTPUT_PATH.write_text(dump, encoding="utf-8", newline="\n")
     size_kb = OUTPUT_PATH.stat().st_size / 1024
     print(f"Scritto {OUTPUT_PATH} ({size_kb:.1f} KB)")

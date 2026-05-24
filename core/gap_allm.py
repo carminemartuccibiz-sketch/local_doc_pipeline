@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -88,6 +89,19 @@ def clear_sot_sync_state() -> None:
             logger.info("Rimosso %s", p)
 
 
+def _slug_cache_fresh(state: dict[str, Any]) -> bool:
+    ts = state.get("slug_verified_at")
+    if not ts:
+        return False
+    try:
+        verified = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        if verified.tzinfo is None:
+            verified = verified.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) - verified < timedelta(hours=24)
+    except (TypeError, ValueError):
+        return False
+
+
 def resolve_sot_workspace_slug(client: AnythingLLMClient) -> str:
     """
     Slug reale dal server AnythingLLM (evita mismatch dvamocles-sot-canon vs dvamocles_sot_canon).
@@ -96,10 +110,19 @@ def resolve_sot_workspace_slug(client: AnythingLLMClient) -> str:
     cached = str(state.get("workspace_slug") or "").strip()
     workspaces = client.list_workspaces()
 
-    if cached:
+    if cached and _slug_cache_fresh(state):
         for ws in workspaces:
             if ws.get("slug") == cached:
+                state["slug_verified_at"] = datetime.now(timezone.utc).isoformat()
+                _save_state(state)
                 return cached
+        logger.warning(
+            "Cached workspace slug %s non trovato su AnythingLLM — re-resolve",
+            cached,
+        )
+
+    if cached and not _slug_cache_fresh(state):
+        logger.info("Slug cache scaduta (>24h) — ri-verifica workspace AnythingLLM")
 
     for ws in workspaces:
         if ws.get("name") == ALLM_SOT_WORKSPACE_NAME:
@@ -107,6 +130,7 @@ def resolve_sot_workspace_slug(client: AnythingLLMClient) -> str:
             if slug:
                 logger.info("Workspace SOT trovato per nome: slug=%s", slug)
                 state["workspace_slug"] = slug
+                state["slug_verified_at"] = datetime.now(timezone.utc).isoformat()
                 _save_state(state)
                 return slug
 
@@ -115,6 +139,7 @@ def resolve_sot_workspace_slug(client: AnythingLLMClient) -> str:
         slug=ALLM_SOT_WORKSPACE_SLUG,
     )
     state["workspace_slug"] = slug
+    state["slug_verified_at"] = datetime.now(timezone.utc).isoformat()
     _save_state(state)
     return slug
 
@@ -184,16 +209,22 @@ def sync_sot_to_anythingllm(
         uploaded = {}
         logger.info("Reset cache upload SOT (force=%s, slug=%s)", force, slug)
 
+    embed_mode = _embed_mode()
+    logger.info("AnythingLLM SOT sync: embed_mode=%s (force=%s)", embed_mode, force)
+
     remote_keys: set[str] = set()
     try:
         remote_keys = client.list_workspace_document_keys(slug)
         if remote_keys:
             logger.info(
-                "AnythingLLM: %d documenti già nel workspace (controllo duplicati)",
+                "AnythingLLM delta: %d chiavi documento già nel workspace",
                 len(remote_keys),
             )
     except Exception as e:
-        logger.debug("Lista documenti workspace non disponibile: %s", e)
+        logger.warning(
+            "Delta sync: list_documents non disponibile (%s) — upload senza skip remoto",
+            e,
+        )
 
     to_upload: list[tuple[str, Path]] = []
     skipped = 0
@@ -203,7 +234,9 @@ def sync_sot_to_anythingllm(
         if not force and _sot_entry_current(uploaded, rel, path):
             skipped += 1
             continue
-        if not force and (rel in remote_keys or _sot_in_workspace(rel, path, remote_keys)):
+        if remote_keys and (
+            rel in remote_keys or _sot_in_workspace(rel, path, remote_keys)
+        ):
             prev = _normalize_uploaded_entry(uploaded.get(rel, ""))
             loc = prev.get("location") or "remote-existing"
             if embed_mode == "manual":
@@ -213,12 +246,9 @@ def sync_sot_to_anythingllm(
                 "md5": _file_md5(path),
             }
             skipped += 1
-            logger.debug("SOT già in workspace (skip upload): %s", rel)
+            logger.debug("SOT già in workspace (delta skip): %s", rel)
             continue
         to_upload.append((rel, path))
-
-    embed_mode = _embed_mode()
-    logger.info("AnythingLLM SOT sync: embed_mode=%s", embed_mode)
 
     if not to_upload:
         rag_ok = False

@@ -16,7 +16,7 @@ Riferimento al piano di review (P0–PR-5). Stato implementazione in codice.
 | P2-4 | ✅ | `gap_allm_state.json` in `02_SESSION_MEMORY/` |
 | PR-3 | ✅ | Client LM unificato |
 | Legacy `pipeline.py` | ⏳ | Spostamento in `legacy/` pianificato, non ancora fatto |
-| force_allm sync delta | ⏳ | `list_documents` prima re-upload — backlog |
+| force_allm sync delta | ✅ | `list_documents` + skip remoto in `sync_sot_to_anythingllm` (anche `force=True`) |
 
 ## Checklist validazione
 

@@ -19,6 +19,8 @@ logs/
 # Python
 __pycache__/
 *.pyc
+*.bak
+*.tmp
 .pytest_cache/
 
 # Progetti runtime orchestratore

@@ -384,6 +384,108 @@ def _chunk_meta_to_json(meta: ChunkMeta, *, total: int) -> dict:
     return row
 
 
+def _ingest_use_chunking_v2() -> bool:
+    """Opt-in: semantic heading-tree chunker (core/chunking_v2.py)."""
+    return os.environ.get("INGEST_USE_CHUNKING_V2", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def ingest_chunk_strategy() -> str:
+    if _ingest_use_chunking_v2():
+        return "semantic_v2_heading_context"
+    return "markdown_structural_overlap"
+
+
+def _strip_v2_context_prefix(text: str) -> tuple[str, int]:
+    """Rimuove prefisso overlap heading-context per localizzazione char nel body."""
+    if not text.startswith("[Contesto:"):
+        return text, 0
+    close = text.find("]\n")
+    if close < 0:
+        return text, 0
+    return text[close + 2 :], close + 2
+
+
+def _resolve_ingest_model_hint() -> str:
+    try:
+        from core.ai_tasks import get_session_lm_model
+
+        return get_session_lm_model()
+    except Exception:
+        return "cl100k_base"
+
+
+def _semantic_chunks_to_text_chunks(
+    body: str,
+    semantic_chunks: list,
+) -> tuple[list[TextChunk], list[ChunkMeta]]:
+    """Mappa SemanticChunk → TextChunk + ChunkMeta per pipeline ingest / ai_tasks."""
+    text_chunks: list[TextChunk] = []
+    metas: list[ChunkMeta] = []
+    search_at = 0
+
+    for sc in semantic_chunks:
+        raw_text, prefix_len = _strip_v2_context_prefix(sc.text)
+        char_start = _locate_chunk_in_body(body, raw_text, search_at)
+        char_end = min(len(body), char_start + len(raw_text))
+        search_at = max(search_at, char_end)
+
+        label = (sc.parent_heading or f"chunk_{sc.index + 1}")[:80]
+        tok = count_tokens(sc.text, model_hint=_resolve_ingest_model_hint())
+        text_chunks.append(
+            TextChunk(
+                index=sc.index,
+                label=label,
+                text=sc.text,
+                token_estimate=tok,
+            )
+        )
+        metas.append(
+            ChunkMeta(
+                index=sc.index,
+                label=label,
+                char_start=char_start,
+                char_end=char_end,
+                token_estimate=tok,
+                overlap_with_prev_chars=prefix_len if sc.index > 0 else 0,
+                overlap_with_next_chars=0,
+            )
+        )
+
+    return text_chunks, metas
+
+
+def _build_chunks_semantic_v2(
+    body: str,
+    *,
+    max_tokens: int,
+    model_hint: str | None = None,
+) -> tuple[list[TextChunk], list[ChunkMeta]]:
+    from core.chunking_v2 import semantic_chunk
+
+    hint = model_hint or _resolve_ingest_model_hint()
+    semantic = semantic_chunk(body, max_tokens=max_tokens, model_hint=hint)
+
+    if not semantic:
+        tok = count_tokens(body, model_hint=hint)
+        return (
+            [TextChunk(0, "full", body, tok)],
+            [ChunkMeta(0, "full", 0, len(body), tok)],
+        )
+
+    try:
+        from core.semantic_dedup import minhash_dedup
+
+        semantic = minhash_dedup(semantic)
+    except ImportError:
+        pass
+
+    return _semantic_chunks_to_text_chunks(body, semantic)
+
+
 def _build_chunks_with_overlap(
     body: str,
     *,
@@ -391,9 +493,17 @@ def _build_chunks_with_overlap(
     overlap_chars: int = OVERLAP_CHARS,
 ) -> tuple[list[TextChunk], list[ChunkMeta]]:
     """
-    Chunking: sezioni Markdown (##) → paragrafi/frasi → overlap strutturale.
-    Nessun taglio a metà di ```, liste o frasi se evitabile.
+    Chunking: sezioni Markdown (##) → paragrafi/frasi → overlap strutturale,
+    oppure semantic_v2 (heading tree + overlap heading-context) se INGEST_USE_CHUNKING_V2=true.
     """
+    if _ingest_use_chunking_v2():
+        logger.info(
+            "Ingest chunking: semantic_v2 (max_tokens=%d, model_hint=%s)",
+            max_tokens,
+            _resolve_ingest_model_hint(),
+        )
+        return _build_chunks_semantic_v2(body, max_tokens=max_tokens)
+
     base_chunks = split_markdown_sections(body, max_tokens=max_tokens)
     base_chunks = _refine_chunks_to_token_budget(base_chunks, max_tokens=max_tokens)
 
@@ -783,7 +893,7 @@ def sliding_window_analyze(
     _log_ui(
         log_fn,
         f"[INGEST] {len(chunks)} chunk "
-        f"(budget {chunk_token_budget} tok, overlap {overlap_chars} char)",
+        f"(budget {chunk_token_budget} tok, strategy {ingest_chunk_strategy()})",
     )
 
     # ── 2. Cartella isolata per questo file ──────────────────────────────
@@ -807,12 +917,12 @@ def sliding_window_analyze(
         "source_file": file_path.name,
         "source_md5": source_md5,
         "chunked_at": _format_chunked_at(),
-        "chunk_strategy": "markdown_structural_overlap",
+        "chunk_strategy": ingest_chunk_strategy(),
         "chunk_token_budget": chunk_token_budget,
         "overlap_tokens": _overlap_tokens_estimate(
             overlap_chars, sample=body[:overlap_chars]
         ),
-        "overlap_chars": overlap_chars,
+        "overlap_chars": overlap_chars if not _ingest_use_chunking_v2() else 0,
         "total_chunks": len(chunks),
         "chunks": [_chunk_meta_to_json(m, total=len(metas)) for m in metas],
     }

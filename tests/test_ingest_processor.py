@@ -97,6 +97,24 @@ def test_build_chunks_overlap_on_paragraph_boundary() -> None:
     assert metas[1].overlap_with_prev_chars > 0
 
 
+def test_build_chunks_semantic_v2_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    from engine.ingest_processor import ingest_chunk_strategy
+
+    monkeypatch.setenv("INGEST_USE_CHUNKING_V2", "true")
+    body = (
+        "# Title\n\n```python\nprint('hello')\nprint('world')\n```\n\n"
+        "## Section\n\nMore text here."
+    )
+    chunks, metas = _build_chunks_with_overlap(body, max_tokens=80, overlap_chars=200)
+    assert ingest_chunk_strategy() == "semantic_v2_heading_context"
+    assert len(chunks) >= 1
+    combined = "\n".join(c.text for c in chunks)
+    assert "print('world')" in combined
+    assert all(isinstance(c.label, str) for c in chunks)
+    assert all(m.token_estimate > 0 for m in metas)
+    assert metas[0].overlap_with_prev_chars == 0
+
+
 def test_fence_spans_detects_block() -> None:
     text = "prima\n```js\nx=1\n```\ndopo"
     spans = _fence_spans(text)

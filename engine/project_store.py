@@ -5,14 +5,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from config import PIPELINE_ROOT
+from core.dedup import find_similar_entry, read_text_for_dedup, signature_for_file
 from core.file_io import atomic_write_json
 from engine.project_memory import ingest_manifest_path
+
+logger = logging.getLogger(__name__)
 
 PROJECTS_ROOT = PIPELINE_ROOT / "projects"
 VALID_ROLES = frozenset({"SOT", "Reference", "Raw"})
@@ -158,17 +162,26 @@ def file_md5(path: Path) -> str:
 
 def load_ingest_manifest(slug: str) -> dict[str, Any]:
     path = ingest_manifest_path(slug)
+    empty: dict[str, Any] = {
+        "version": 2,
+        "by_md5": {},
+        "files": {},
+        "minhash_entries": [],
+    }
     if not path.is_file():
-        return {"version": 1, "by_md5": {}, "files": {}}
+        return empty
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
         if isinstance(raw, dict):
             raw.setdefault("by_md5", {})
             raw.setdefault("files", {})
+            raw.setdefault("minhash_entries", [])
+            if raw.get("version", 1) < 2:
+                raw["version"] = 2
             return raw
     except (json.JSONDecodeError, OSError):
         pass
-    return {"version": 1, "by_md5": {}, "files": {}}
+    return empty
 
 
 def save_ingest_manifest(slug: str, manifest: dict[str, Any]) -> None:
@@ -181,15 +194,66 @@ def _ingest_complete(slug: str, stem: str) -> bool:
     return (sub / "chunks.json").is_file() and (sub / "analysis.md").is_file()
 
 
+def _register_minhash_entry(
+    entries: list[dict[str, Any]],
+    *,
+    name: str,
+    md5: str,
+    signature: list[int],
+    status: str,
+) -> None:
+    for ent in entries:
+        if ent.get("name") == name or ent.get("md5") == md5:
+            ent.update(
+                {
+                    "name": name,
+                    "md5": md5,
+                    "signature": signature,
+                    "status": status,
+                }
+            )
+            return
+    entries.append(
+        {
+            "name": name,
+            "md5": md5,
+            "signature": signature,
+            "status": status,
+        }
+    )
+
+
+def _log_dedup_skip(
+    log_fn: Callable[[str], None] | None,
+    path: Path,
+    match_name: str,
+    *,
+    similarity: float,
+    exact_md5: bool,
+) -> None:
+    if exact_md5 or similarity >= 0.999:
+        msg = f"[WARN] Documento già presente: {path.name} (identico a {match_name})"
+    else:
+        msg = (
+            f"[WARN] Documento già presente: {path.name} "
+            f"(~{similarity:.0%} simile a {match_name})"
+        )
+    if log_fn:
+        log_fn(msg)
+    else:
+        logger.warning(msg.replace("[WARN] ", ""))
+
+
 def list_ingest_sources(
     slug: str,
     *,
     skip_duplicates: bool = True,
     skip_completed: bool = True,
+    log_fn: Callable[[str], None] | None = None,
 ) -> list[Path]:
     """
     File top-level in 01_INGEST da processare.
-    Deduplica MD5 (manifest 04_MEMORY) e salta cartelle già analizzate.
+    Deduplica MD5 + MinHash (~95% Jaccard) via manifest 04_MEMORY.
     """
     ingest = _project_path(slug) / "01_INGEST"
     if not ingest.is_dir():
@@ -198,6 +262,7 @@ def list_ingest_sources(
     manifest = load_ingest_manifest(slug)
     by_md5: dict[str, Any] = manifest.setdefault("by_md5", {})
     files_meta: dict[str, Any] = manifest.setdefault("files", {})
+    minhash_entries: list[dict[str, Any]] = manifest.setdefault("minhash_entries", [])
     sources: list[Path] = []
     dirty = False
 
@@ -208,7 +273,47 @@ def list_ingest_sources(
         md5 = file_md5(path)
         prev = by_md5.get(md5)
         if skip_duplicates and prev and prev.get("name") != path.name:
+            _log_dedup_skip(
+                log_fn,
+                path,
+                str(prev.get("name") or "?"),
+                similarity=1.0,
+                exact_md5=True,
+            )
             continue
+
+        signature = signature_for_file(path)
+        body_for_dedup = read_text_for_dedup(path)
+
+        if skip_duplicates:
+            similar = find_similar_entry(
+                signature,
+                minhash_entries,
+                candidate_text=body_for_dedup,
+                resolve_text=lambda name: read_text_for_dedup(ingest / name),
+            )
+            if similar and similar.name != path.name:
+                _log_dedup_skip(
+                    log_fn,
+                    path,
+                    similar.name,
+                    similarity=similar.similarity,
+                    exact_md5=similar.exact or similar.md5 == md5,
+                )
+                by_md5[md5] = {
+                    "name": path.name,
+                    "status": "duplicate",
+                    "md5": md5,
+                    "duplicate_of": similar.name,
+                    "similarity": round(similar.similarity, 4),
+                }
+                files_meta[path.name] = {
+                    "md5": md5,
+                    "status": "duplicate",
+                    "duplicate_of": similar.name,
+                }
+                dirty = True
+                continue
 
         if skip_completed and _ingest_complete(slug, path.stem):
             by_md5[md5] = {
@@ -217,12 +322,26 @@ def list_ingest_sources(
                 "md5": md5,
             }
             files_meta[path.name] = {"md5": md5, "status": "completed"}
+            _register_minhash_entry(
+                minhash_entries,
+                name=path.name,
+                md5=md5,
+                signature=signature,
+                status="completed",
+            )
             dirty = True
             continue
 
         sources.append(path)
         by_md5[md5] = {"name": path.name, "status": "pending", "md5": md5}
         files_meta[path.name] = {"md5": md5, "status": "pending"}
+        _register_minhash_entry(
+            minhash_entries,
+            name=path.name,
+            md5=md5,
+            signature=signature,
+            status="pending",
+        )
         dirty = True
 
     if dirty:
@@ -235,6 +354,7 @@ def mark_ingest_file_done(slug: str, path: Path) -> None:
     """Aggiorna manifest dopo ingest sliding window riuscito."""
     manifest = load_ingest_manifest(slug)
     md5 = file_md5(path)
+    signature = signature_for_file(path)
     manifest.setdefault("by_md5", {})[md5] = {
         "name": path.name,
         "status": "completed",
@@ -245,4 +365,11 @@ def mark_ingest_file_done(slug: str, path: Path) -> None:
         "md5": md5,
         "status": "completed",
     }
+    _register_minhash_entry(
+        manifest.setdefault("minhash_entries", []),
+        name=path.name,
+        md5=md5,
+        signature=signature,
+        status="completed",
+    )
     save_ingest_manifest(slug, manifest)

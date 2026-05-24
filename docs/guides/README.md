@@ -17,7 +17,8 @@ Indice della documentazione di progetto e del blueprint Cursor.
 | [`../../ROOTPAM.md`](../../ROOTPAM.md) | Mappa repo + storico modifiche IA (auto) |
 | [`../../AI_DEV_SESSIONS/README.md`](../../AI_DEV_SESSIONS/README.md) | Log sessioni coding |
 | `python scripts/update_dev_router.py` | Aggiorna ROOTPAM da `AI_DEV_SESSIONS/` |
-| `python scripts/generate_repomix.py` | Genera `_LLM_CONTEXT_DUMP.txt` per Claude/Cursor |
+| `python scripts/generate_repomix.py --include-dmip` | Genera `_LLM_CONTEXT_DUMP.txt` (orchestrator + DMIP) |
+| `python scripts/smoke_test.py --spawn-server` | Smoke MT-1.13 (progetto temp + jobs/start) |
 
 **Consiglio:** esegui `generate_repomix` **solo prima di esportare** il contesto — non collegarlo a `dvamocles_daemon.bat` (avvio runtime utente).
 
@@ -55,10 +56,18 @@ python legacy\cli.py check      # Preflight LM Studio + AnythingLLM
 python legacy\cli.py run        # Gap analysis CLI (legacy)
 ```
 
+## DMIP (greenfield)
+
+| Risorsa | Uso |
+|---------|-----|
+| [`../../../dmip/README.md`](../../../dmip/README.md) | Backend FastAPI + Chroma (sibling `tools/dmip/`) |
+| [`claude-commands-dir/AUDIT_REPORT.md`](claude-commands-dir/AUDIT_REPORT.md) | Audit orchestrator + DMIP |
+
 ## Workflow UI (progetto)
 
 - **ingest** / **sliding_window**: file in `projects/<slug>/01_INGEST/` → analisi in sottocartelle + `04_MEMORY/ingest_manifest.json` (dedup MD5).
 - **gap_analysis**: stesso ingest, report in `projects/<slug>/03_OUTPUT/Gap_Report_Generale.md`, state in `04_MEMORY/pipeline_state.json`.
+- **doc_refactor**, **flow**, **devblog**, **reflect**: plugin aggiuntivi (vedi `engine/workflow_runner.py`).
 
 ## Test sliding window (Fase 3)
 
