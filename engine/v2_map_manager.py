@@ -28,7 +28,6 @@ MAP_SCHEMA_VERSION = 1
 _PATH_LOCKS_GUARD = threading.Lock()
 _PATH_LOCKS: dict[str, threading.RLock] = {}
 _CHUNK_LOCKS: dict[tuple[str, str], threading.RLock] = {}
-_ASYNC_LOCKS: dict[str, asyncio.Lock] = {}
 
 KNOWLEDGE_STATE_DEFAULT: dict[str, bool] = {
     "facts_extracted": False,
@@ -231,14 +230,7 @@ def _shared_chunk_lock(path: Path, chunk_id: str) -> threading.RLock:
         return lock
 
 
-def _shared_async_lock(path: Path) -> asyncio.Lock:
-    key = _path_key(path)
-    with _PATH_LOCKS_GUARD:
-        lock = _ASYNC_LOCKS.get(key)
-        if lock is None:
-            lock = asyncio.Lock()
-            _ASYNC_LOCKS[key] = lock
-        return lock
+
 
 
 class V2MapManager:
@@ -274,8 +266,6 @@ class V2MapManager:
     def path(self) -> Path:
         return self._path
 
-    def _get_async_lock(self) -> asyncio.Lock:
-        return _shared_async_lock(self._path)
 
     def _chunk_lock(self, chunk_id: str) -> threading.RLock:
         return _shared_chunk_lock(self._path, chunk_id)
@@ -736,23 +726,19 @@ class V2MapManager:
             ]
             self.save()
 
-    # --- Async API (future worker / asyncio pipeline) ---
+# --- Async API (future worker / asyncio pipeline) ---
 
     async def areload(self) -> dict[str, Any]:
-        async with self._get_async_lock():
-            return await asyncio.to_thread(self.reload)
+        return await asyncio.to_thread(self.reload)
 
     async def asave(self) -> None:
-        async with self._get_async_lock():
-            await asyncio.to_thread(self.save)
+        await asyncio.to_thread(self.save)
 
     async def aupdate_chunk(self, chunk_id: str, patch: dict[str, Any]) -> dict[str, Any]:
-        async with self._get_async_lock():
-            return await asyncio.to_thread(self.update_chunk, chunk_id, patch)
+        return await asyncio.to_thread(self.update_chunk, chunk_id, patch)
 
     async def aupdate_rolling_memory(self, patch: dict[str, Any]) -> dict[str, Any]:
-        async with self._get_async_lock():
-            return await asyncio.to_thread(self.update_rolling_memory, patch)
+        return await asyncio.to_thread(self.update_rolling_memory, patch)
 
     def __enter__(self) -> V2MapManager:
         self._file_lock.acquire()
