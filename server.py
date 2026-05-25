@@ -349,7 +349,6 @@ def logs_stream():
         headers={
             "Cache-Control": "no-cache, no-store",
             "X-Accel-Buffering": "no",
-            "Connection": "keep-alive",
             "X-Content-Type-Options": "nosniff",
         },
     )

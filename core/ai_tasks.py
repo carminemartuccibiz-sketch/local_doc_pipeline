@@ -1155,3 +1155,123 @@ def llm_extract_facts(*, text: str, context: str, max_tokens: int) -> str:
         max_tokens=max_tokens,
     )
     return _strip_json_fence(raw)
+
+# =====================================================================
+# V2 AGENTIC RAG EXTENSIONS (Vision & Rolling Context)
+# =====================================================================
+
+def llm_complete_vision(image_path: str | Path, context: str, prompt: str) -> str:
+    """Invia un'immagine (Base64) e un contesto testuale a un modello Vision locale."""
+    import base64
+    import os
+    import httpx
+    import logging
+    from pathlib import Path
+
+    logger = logging.getLogger(__name__)
+    img_path = Path(image_path)
+    
+    if not img_path.is_file():
+        logger.warning(f"[VISION] Immagine non trovata: {img_path}")
+        return "Immagine non trovata per l'analisi visiva."
+        
+    try:
+        # Converti immagine in base64
+        with open(img_path, "rb") as f:
+            img_b64 = base64.b64encode(f.read()).decode("utf-8")
+            
+        mime_type = "image/png" if img_path.suffix.lower() == ".png" else "image/jpeg"
+        
+        # Recupera configurazioni attuali
+        model = get_session_lm_model()
+        base_url = os.environ.get("LM_STUDIO_URL", "http://127.0.0.1:1234/v1").rstrip("/")
+        url = f"{base_url}/chat/completions"
+        
+        # Payload multimodale stile OpenAI Vision
+        payload = {
+            "model": model,
+            "messages": [
+                {
+                    "role": "system", 
+                    "content": "Sei un analista tecnico. Spiega l'immagine basandoti ESCLUSIVAMENTE sul contesto testuale fornito."
+                },
+                {
+                    "role": "user", 
+                    "content": [
+                        {"type": "text", "text": f"Contesto testuale:\n{context}\n\nRichiesta: {prompt}"},
+                        {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{img_b64}"}}
+                    ]
+                }
+            ],
+            "max_tokens": 1000,
+            "temperature": 0.3
+        }
+        
+        headers = {"Content-Type": "application/json"}
+        api_key = os.environ.get("LM_STUDIO_API_KEY", "lm-studio")
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+            
+        # Esegui chiamata HTTP
+        with httpx.Client(timeout=180.0) as client:
+            resp = client.post(url, json=payload, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+            return data["choices"][0]["message"]["content"].strip()
+            
+    except Exception as e:
+        logger.error(f"Errore Vision LLM su {img_path.name}: {e}")
+        return f"[Errore durante l'analisi visiva: {str(e)}]"
+
+
+def llm_extract_facts(text: str, history: str) -> Any:
+    """Estrae fatti strutturati e comprime il contesto. Forza l'output JSON."""
+    import json
+    import logging
+
+    logger = logging.getLogger(__name__)
+    
+    system_prompt = (
+        "Sei un estrattore di conoscenza semantica. Riceverai un 'Contesto Storico' e un 'Nuovo Testo'. "
+        "Devi restituire UNICAMENTE un oggetto JSON valido con questa struttura esatta:\n"
+        "{\n"
+        "  \"structured_facts\": {\"facts\": [\"fatto 1\", \"fatto 2\"], \"entities\": [\"entità 1\"]},\n"
+        "  \"new_compressed_context\": \"Riassunto unito della storia + nuovo testo (max 1000 char)\"\n"
+        "}\n"
+        "Non includere markdown ```json o altro testo, solo l'oggetto JSON."
+    )
+    
+    user_prompt = f"STORIA PRECEDENTE:\n{history}\n\nNUOVO TESTO DA ANALIZZARE:\n{text}"
+    
+    try:
+        # Sfrutta il sistema di fallback ed error handling già presente in smart_llm_complete
+        response = smart_llm_complete(
+            system_prompt=system_prompt, 
+            user_message=user_prompt
+        )
+        
+        raw = response.strip()
+        # Pulizia robusta nel caso in cui l'LLM aggiunga i tag markdown ```json ... ```
+        if raw.startswith("```"):
+            lines = raw.splitlines()
+            if lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].startswith("```"):
+                lines = lines[:-1]
+            raw = "\n".join(lines).strip()
+            
+        return json.loads(raw)
+        
+    except json.JSONDecodeError as je:
+        logger.error(f"LLM ha generato JSON non valido in extract_facts: {je}\nRaw: {response}")
+        # Fallback di sicurezza per non interrompere la catena
+        return {
+            "structured_facts": {"facts": [], "entities": []},
+            "new_compressed_context": history + "\n\n" + text[:500] + "... [Compressione Fallita]"
+        }
+    except Exception as e:
+        logger.error(f"Errore in llm_extract_facts: {e}")
+        return {
+            "structured_facts": {"facts": [], "entities": []},
+            "new_compressed_context": history
+        }

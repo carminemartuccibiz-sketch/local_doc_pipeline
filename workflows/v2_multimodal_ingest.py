@@ -40,7 +40,6 @@ def _resolve_vision_caller(ctx: dict[str, Any]) -> VisionLLMCaller | None:
         return injected
     if _env_enabled("V2_VISION_ENABLED"):
         from core.ai_tasks import llm_complete_vision
-
         return llm_complete_vision
     return None
 
@@ -52,7 +51,6 @@ def _resolve_fact_extractor(ctx: dict[str, Any]) -> FactExtractorLLM | None:
         return injected
     if _env_enabled("V2_ROLLING_CONTEXT_ENABLED"):
         from core.ai_tasks import llm_extract_facts
-
         return llm_extract_facts
     return None
 
@@ -76,16 +74,7 @@ def discover_ingest_files(slug: str) -> list[Path]:
 class V2MultimodalIngestWorkflow(BaseWorkflow):
     """
     Workflow beta — ingest multimodale V2.
-
-    Per ogni file in ``01_INGEST`` (``.pdf``, ``.md``, ``.txt``):
-      1. Scaffold ``02_STAGING/<doc_id>/``
-      2. Copia sorgente in ``original/``
-      3. ``PhysicalExtractor`` (PDF) o normalizzazione testo (md/txt)
-      4. ``V2ChunkingManager`` → ``chunks/chunk_NNN.md`` + map.json
-      5. ``V2VisionEnricher`` se opt-in (``V2_VISION_ENABLED=1`` o ``ctx['vision_caller']``)
-      6. ``V2RollingMemory`` se opt-in (``V2_ROLLING_CONTEXT_ENABLED=1`` o ``ctx['fact_extractor']``)
     """
-
     capabilities = WorkflowCapabilities(
         requires_llm=False,
         requires_rag=False,
@@ -115,7 +104,7 @@ class V2MultimodalIngestWorkflow(BaseWorkflow):
         for index, src in enumerate(sources):
             ctx["file_index"] = index
             ctx["files_in_job"] = len(sources)
-         try:
+            try:
                 results.append(self.run(src, ctx))
             except Exception as exc:
                 log_fn(f"[{_WORKFLOW_TAG}] Impossibile processare {src.name}: {exc}")
