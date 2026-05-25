@@ -115,10 +115,10 @@ class V2MultimodalIngestWorkflow(BaseWorkflow):
         for index, src in enumerate(sources):
             ctx["file_index"] = index
             ctx["files_in_job"] = len(sources)
-            try:
+         try:
                 results.append(self.run(src, ctx))
-            except ValueError as exc:
-                log_fn(f"[{_WORKFLOW_TAG}] Skip {src.name}: {exc}")
+            except Exception as exc:
+                log_fn(f"[{_WORKFLOW_TAG}] Impossibile processare {src.name}: {exc}")
 
         ok = sum(1 for r in results if r.get("status") == "ok")
         return {
