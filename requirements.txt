@@ -20,5 +20,5 @@ unstructured[pdf,docx]>=0.18.32
 # V2 multimodal ingest (Agentic RAG — pymupdf/fitz, OCR, immagini)
 pymupdf>=1.23.0
 pytesseract>=0.3.10
-Pillow>=10.0.0
+Pillow>=12.2.0
 filelock>=3.13,<4.0
