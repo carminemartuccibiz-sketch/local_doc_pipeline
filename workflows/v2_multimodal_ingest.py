@@ -1,11 +1,15 @@
 """
-V2 multimodal ingest — orchestrazione pipeline fisica (beta).
+V2 multimodal ingest — orchestrazione pipeline fisica + stage opzionali.
 
-Catena: intake 01_INGEST → staging V2 → PhysicalExtractor → V2ChunkingManager.
-Fase LLM (Vision / Rolling Context) — placeholder Prompt 6+.
+Catena:
+  Stage 1: PhysicalExtractor
+  Stage 2: V2ChunkingManager
+  Stage 3: V2VisionEnricher (opt-in: ``ctx['vision_caller']`` o ``V2_VISION_ENABLED``)
+  Stage 4: V2RollingMemory (opt-in: ``ctx['fact_extractor']`` o ``V2_ROLLING_CONTEXT_ENABLED``)
 """
 from __future__ import annotations
 
+import os
 import shutil
 from pathlib import Path
 from typing import Any
@@ -14,13 +18,43 @@ from engine.project_memory import ingest_dir, setup_v2_staging_dirs
 from engine.v2_chunking_manager import V2ChunkingManager
 from engine.v2_map_manager import V2MapManager
 from engine.v2_physical_extractor import RAW_EXTRACTED_NAME, PhysicalExtractor
+from engine.v2_rolling_memory import FactExtractorLLM, V2RollingMemory
+from engine.v2_vision_enricher import V2VisionEnricher, VisionLLMCaller
 from workflows.base_workflow import BaseWorkflow
 from workflows.capabilities import WorkflowCapabilities
 from workflows.workflow_progress import report_phase
 
 _WORKFLOW_TAG = "V2_INGEST"
-_PHASES_TOTAL = 3
+_BASE_PHASES = 3
 _V2_COMPAT_EXTENSIONS = frozenset({".pdf", ".md", ".txt"})
+
+
+def _env_enabled(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes")
+
+
+def _resolve_vision_caller(ctx: dict[str, Any]) -> VisionLLMCaller | None:
+    """DI esplicita nel ctx ha priorità su env ``V2_VISION_ENABLED``."""
+    injected = ctx.get("vision_caller")
+    if injected is not None:
+        return injected
+    if _env_enabled("V2_VISION_ENABLED"):
+        from core.ai_tasks import llm_complete_vision
+
+        return llm_complete_vision
+    return None
+
+
+def _resolve_fact_extractor(ctx: dict[str, Any]) -> FactExtractorLLM | None:
+    """DI esplicita nel ctx ha priorità su env ``V2_ROLLING_CONTEXT_ENABLED``."""
+    injected = ctx.get("fact_extractor")
+    if injected is not None:
+        return injected
+    if _env_enabled("V2_ROLLING_CONTEXT_ENABLED"):
+        from core.ai_tasks import llm_extract_facts
+
+        return llm_extract_facts
+    return None
 
 
 def discover_ingest_files(slug: str) -> list[Path]:
@@ -41,13 +75,15 @@ def discover_ingest_files(slug: str) -> list[Path]:
 
 class V2MultimodalIngestWorkflow(BaseWorkflow):
     """
-    Workflow beta — ingest multimodale V2 senza chiamate LLM (fase 1).
+    Workflow beta — ingest multimodale V2.
 
     Per ogni file in ``01_INGEST`` (``.pdf``, ``.md``, ``.txt``):
       1. Scaffold ``02_STAGING/<doc_id>/``
       2. Copia sorgente in ``original/``
       3. ``PhysicalExtractor`` (PDF) o normalizzazione testo (md/txt)
       4. ``V2ChunkingManager`` → ``chunks/chunk_NNN.md`` + map.json
+      5. ``V2VisionEnricher`` se opt-in (``V2_VISION_ENABLED=1`` o ``ctx['vision_caller']``)
+      6. ``V2RollingMemory`` se opt-in (``V2_ROLLING_CONTEXT_ENABLED=1`` o ``ctx['fact_extractor']``)
     """
 
     capabilities = WorkflowCapabilities(
@@ -99,6 +135,11 @@ class V2MultimodalIngestWorkflow(BaseWorkflow):
 
         log_fn = ctx.get("log_fn") or (lambda _m: None)
         stop_event = ctx.get("stop_event")
+        vision_caller = _resolve_vision_caller(ctx)
+        fact_extractor = _resolve_fact_extractor(ctx)
+        phases_total = _BASE_PHASES + int(vision_caller is not None) + int(
+            fact_extractor is not None
+        )
 
         def _check_stop() -> None:
             if stop_event is not None and stop_event.is_set():
@@ -107,6 +148,20 @@ class V2MultimodalIngestWorkflow(BaseWorkflow):
         src = Path(file_path)
         if not src.is_file():
             raise FileNotFoundError(f"File ingest non trovato: {src}")
+
+        phase_no = 0
+
+        def _report(label: str) -> None:
+            nonlocal phase_no
+            phase_no += 1
+            report_phase(
+                ctx,
+                tag=_WORKFLOW_TAG,
+                phase=phase_no,
+                total=phases_total,
+                label=label,
+                file_path=src,
+            )
 
         suffix = src.suffix.lower()
         if suffix not in _V2_COMPAT_EXTENSIONS:
@@ -119,14 +174,7 @@ class V2MultimodalIngestWorkflow(BaseWorkflow):
         log_fn(f"[{_WORKFLOW_TAG}] Intake: {src.name} → doc_id={document_id}")
 
         _check_stop()
-        report_phase(
-            ctx,
-            tag=_WORKFLOW_TAG,
-            phase=1,
-            total=_PHASES_TOTAL,
-            label="Setup staging V2 + map.json",
-            file_path=src,
-        )
+        _report("Setup staging V2 + map.json")
         layout = setup_v2_staging_dirs(slug, document_id)
         map_manager = V2MapManager(layout.map_json)
         map_manager.update_document(
@@ -142,13 +190,10 @@ class V2MultimodalIngestWorkflow(BaseWorkflow):
             log_fn(f"[{_WORKFLOW_TAG}] Copiato in {dest.relative_to(layout.root)}")
 
         _check_stop()
-        report_phase(
-            ctx,
-            tag=_WORKFLOW_TAG,
-            phase=2,
-            total=_PHASES_TOTAL,
-            label="Physical extraction (PyMuPDF)" if suffix == ".pdf" else "Text normalization",
-            file_path=src,
+        _report(
+            "Physical extraction (PyMuPDF)"
+            if suffix == ".pdf"
+            else "Text normalization"
         )
 
         if suffix == ".pdf":
@@ -168,28 +213,44 @@ class V2MultimodalIngestWorkflow(BaseWorkflow):
             )
 
         _check_stop()
-        report_phase(
-            ctx,
-            tag=_WORKFLOW_TAG,
-            phase=3,
-            total=_PHASES_TOTAL,
-            label="Physical semantic chunking",
-            file_path=src,
-        )
+        _report("Physical semantic chunking")
         chunk_result = V2ChunkingManager(
             layout,
             map_manager=map_manager,
         ).chunk_raw_extract()
 
-        # ------------------------------------------------------------------
-        # TODO: Fase 2 — Vision e Rolling Context
-        # - Per ogni immagine in map.physical_assets.images con vision_processed=False:
-        #     chiamare LLM/Vision con chunk collegato + rolling_memory strutturato
-        # - Scrivere enriched/chunk_NNN.enriched.md
-        # - Aggiornare rolling_memory/rolling_state.json via merge_rolling_structured
-        # - Impostare rolling_context_ref su ogni chunk in map.json
-        # - knowledge_state.vision_complete / facts_extracted
-        # ------------------------------------------------------------------
+        vision_count = 0
+        if vision_caller is not None:
+            _check_stop()
+            if _env_enabled("V2_VISION_ENABLED") and ctx.get("vision_caller") is None:
+                log_fn(f"[{_WORKFLOW_TAG}] Vision attiva (V2_VISION_ENABLED)")
+            _report("Context-aware vision enrichment")
+            vision_results = V2VisionEnricher(
+                layout,
+                map_manager=map_manager,
+                vision_caller=vision_caller,
+                log_fn=log_fn,
+            ).enrich_all_pending(stop_event=stop_event)
+            vision_count = len(vision_results)
+            log_fn(
+                f"[{_WORKFLOW_TAG}] Vision: {vision_count} immagini arricchite"
+            )
+
+        rolling_count = 0
+        if fact_extractor is not None:
+            _check_stop()
+            if _env_enabled("V2_ROLLING_CONTEXT_ENABLED") and ctx.get("fact_extractor") is None:
+                log_fn(f"[{_WORKFLOW_TAG}] Rolling context attivo (V2_ROLLING_CONTEXT_ENABLED)")
+            _report("Rolling context (facts-based memory)")
+            rolling_count = V2RollingMemory(
+                layout.rolling_memory,
+                map_manager=map_manager,
+                extractor=fact_extractor,
+                log_fn=log_fn,
+            ).process_all_chunks(layout, stop_event=stop_event)
+            log_fn(
+                f"[{_WORKFLOW_TAG}] Rolling: {rolling_count} chunk integrati"
+            )
 
         log_fn(
             f"[{_WORKFLOW_TAG}] ✓ Completato: {chunk_result.chunk_count} chunk fisici "
@@ -203,6 +264,8 @@ class V2MultimodalIngestWorkflow(BaseWorkflow):
             "pages": extract_result.page_count,
             "images": len(extract_result.images),
             "chunks": chunk_result.chunk_count,
+            "vision_enriched": vision_count,
+            "rolling_processed": rolling_count,
             "raw_text": str(extract_result.raw_text_path),
         }
 

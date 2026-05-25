@@ -9,12 +9,13 @@ import asyncio
 import copy
 import json
 import logging
-import sys
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
+
+from filelock import FileLock
 
 from core.file_io import atomic_write_json
 
@@ -33,6 +34,7 @@ KNOWLEDGE_STATE_DEFAULT: dict[str, bool] = {
     "facts_extracted": False,
     "vision_complete": False,
     "conflict_checked": False,
+    "rolling_context_merged": False,
 }
 
 ROLLING_MEMORY_STRUCTURE_DEFAULT: dict[str, list[Any]] = {
@@ -42,6 +44,7 @@ ROLLING_MEMORY_STRUCTURE_DEFAULT: dict[str, list[Any]] = {
     "decisions": [],
     "open_questions": [],
     "vision_insights": [],
+    "temporal_markers": [],
 }
 
 ROLLING_MEMORY_PATHS_DEFAULT: dict[str, str] = {
@@ -125,6 +128,9 @@ def normalize_map_data(raw: dict[str, Any]) -> dict[str, Any]:
         data["physical_assets"] = assets
     assets.setdefault("images", [])
     assets.setdefault("tables", [])
+    for tbl in assets.get("tables", []):
+        if isinstance(tbl, dict):
+            _normalize_table(tbl)
 
     if not isinstance(data.get("chunks"), list):
         data["chunks"] = []
@@ -157,6 +163,12 @@ def normalize_map_data(raw: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
+def _normalize_table(table: dict[str, Any]) -> dict[str, Any]:
+    table.setdefault("linked_chunks", [])
+    table.setdefault("extraction_confidence", None)
+    return table
+
+
 def _normalize_chunk(chunk: dict[str, Any]) -> dict[str, Any]:
     ks = chunk.setdefault("knowledge_state", {})
     if not isinstance(ks, dict):
@@ -176,48 +188,23 @@ def _utc_now_iso() -> str:
 
 
 def _map_lock_path(map_path: Path) -> Path:
-    return map_path.with_name(map_path.name + ".lock")
+    return map_path.with_suffix(map_path.suffix + ".lock")
 
 
 @contextmanager
-def _os_file_lock(lock_path: Path):
-    """
-    Lock esclusivo cross-process (msvcrt su Windows, fcntl altrove).
-    Rilascio garantito in ``finally`` anche se il parsing/scrittura fallisce.
-    """
+def _os_file_lock(map_path: Path):
+    """Cross-process lock portable (``filelock`` — no fcntl/msvcrt)."""
+    lock_path = _map_lock_path(map_path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fh = open(lock_path, "a+b")
-    locked = False
-    try:
-        if sys.platform == "win32":
-            import msvcrt
-
-            fh.seek(0)
-            msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
-        locked = True
+    with FileLock(str(lock_path), timeout=30):
         yield
-    finally:
-        if locked:
-            try:
-                if sys.platform == "win32":
-                    import msvcrt
 
-                    fh.seek(0)
-                    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
-                else:
-                    import fcntl
 
-                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-            except OSError as exc:
-                logger.warning("Rilascio lock OS fallito (%s): %s", lock_path, exc)
-        try:
-            fh.close()
-        except OSError:
-            pass
+def _parse_map_json(map_path: Path) -> dict[str, Any]:
+    raw = json.loads(map_path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError(f"map.json non è un oggetto JSON: {map_path}")
+    return normalize_map_data(raw)
 
 
 def _path_key(path: Path) -> str:
@@ -258,9 +245,12 @@ class V2MapManager:
     """
     CRUD thread-safe su map.json.
 
-    Lock globali:
-      - ``_file_lock`` (RLock): lettura/scrittura file e mutazioni strutturali.
-      - ``_chunk_locks[id]``: update concorrenti su singoli chunk (future worker).
+    Lock globali (ordine di acquisizione obbligatorio — evita deadlock):
+      1. ``_chunk_locks[id]`` (update chunk): acquisito per primo.
+      2. ``_file_lock`` (RLock per path): serializza thread in-process.
+      3. ``_os_file_lock`` (``filelock``): solo in scrittura cross-process.
+
+    Rilettura in-process sotto ``_file_lock`` non usa ``_os_file_lock``.
     Metodi ``a*`` usano ``asyncio.Lock`` + ``to_thread`` per integrazione async.
     """
 
@@ -291,14 +281,16 @@ class V2MapManager:
         return _shared_chunk_lock(self._path, chunk_id)
 
     def _read_map_from_disk(self) -> dict[str, Any]:
-        with _os_file_lock(_map_lock_path(self._path)):
-            raw = json.loads(self._path.read_text(encoding="utf-8"))
-            if not isinstance(raw, dict):
-                raise ValueError(f"map.json non è un oggetto JSON: {self._path}")
-            return normalize_map_data(raw)
+        """Lettura cross-process (``filelock``) — init / accesso senza ``_file_lock``."""
+        with _os_file_lock(self._path):
+            return _parse_map_json(self._path)
+
+    def _read_map_inprocess(self) -> dict[str, Any]:
+        """Lettura in-process — chiamante deve tenere ``_file_lock`` (no ``filelock``)."""
+        return _parse_map_json(self._path)
 
     def _write_map_to_disk(self) -> None:
-        with _os_file_lock(_map_lock_path(self._path)):
+        with _os_file_lock(self._path):
             atomic_write_json(self._path, self._data)
 
     def _load(
@@ -310,7 +302,7 @@ class V2MapManager:
     ) -> dict[str, Any]:
         with self._file_lock:
             if self._path.is_file():
-                return self._read_map_from_disk()
+                return self._read_map_inprocess()
 
             if not auto_create:
                 raise FileNotFoundError(f"map.json mancante: {self._path}")
@@ -325,13 +317,10 @@ class V2MapManager:
             self._write_map_to_disk()
             return data
 
-    def _load_from_disk_unlocked(self) -> dict[str, Any]:
-        return self._read_map_from_disk()
-
     def reload(self) -> dict[str, Any]:
         """Ricarica da disco (es. dopo modifica esterna)."""
         with self._file_lock:
-            self._data = self._load_from_disk_unlocked()
+            self._data = self._read_map_inprocess()
             return copy.deepcopy(self._data)
 
     def save(self) -> None:
@@ -462,7 +451,9 @@ class V2MapManager:
                 "path": str(table.get("path") or ""),
                 "page": table.get("page"),
                 "linked_chunks": list(table.get("linked_chunks") or []),
+                "extraction_confidence": table.get("extraction_confidence"),
             }
+            _normalize_table(entry)
             tables.append(entry)
             self.save()
             return copy.deepcopy(entry)
@@ -496,10 +487,25 @@ class V2MapManager:
         with self._file_lock:
             return copy.deepcopy(self._data["chunks"])
 
+    def _rebuild_chunk_links_unlocked(self) -> None:
+        """Ricalcola previous/next su tutti i chunk in ordine array (idempotente)."""
+        chunks = self._data.get("chunks", [])
+        for i, chunk in enumerate(chunks):
+            chunk["previous_chunk"] = chunks[i - 1]["id"] if i > 0 else None
+            chunk["next_chunk"] = (
+                chunks[i + 1]["id"] if i < len(chunks) - 1 else None
+            )
+
+    def rebuild_chunk_links(self) -> None:
+        """Ricalcola linked list chunk — invocabile in recovery dopo retry parziali."""
+        with self._file_lock:
+            self._rebuild_chunk_links_unlocked()
+            self._write_map_to_disk()
+
     def set_chunks(self, chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """
         Sostituisce l'array ``chunks`` (passo physical chunking V2).
-        Collega ``previous_chunk`` / ``next_chunk`` se assenti (linked list).
+        Collega ``previous_chunk`` / ``next_chunk`` via ``rebuild_chunk_links`` (idempotente).
         """
         with self._file_lock:
             normalized: list[dict[str, Any]] = []
@@ -533,19 +539,8 @@ class V2MapManager:
                     )
                 )
 
-            for i, entry in enumerate(normalized):
-                if entry.get("previous_chunk") is None:
-                    entry["previous_chunk"] = (
-                        normalized[i - 1]["id"] if i > 0 else None
-                    )
-                if entry.get("next_chunk") is None:
-                    entry["next_chunk"] = (
-                        normalized[i + 1]["id"]
-                        if i < len(normalized) - 1
-                        else None
-                    )
-
             self._data["chunks"] = normalized
+            self._rebuild_chunk_links_unlocked()
             self.save()
             return copy.deepcopy(normalized)
 
@@ -591,10 +586,15 @@ class V2MapManager:
             return copy.deepcopy(entry)
 
     def update_chunk(self, chunk_id: str, patch: dict[str, Any]) -> dict[str, Any]:
-        """Update chunk — lock per-chunk + file lock (condivisi tra istanze)."""
+        """
+        Update chunk — reload in-process (``_file_lock``) + write cross-process.
+
+        ``_read_map_inprocess`` evita ``filelock`` in lettura: ``_file_lock``
+        serializza già i thread; ``filelock`` resta solo su ``_write_map_to_disk``.
+        """
         with self._chunk_lock(chunk_id):
             with self._file_lock:
-                self._data = self._load_from_disk_unlocked()
+                self._data = self._read_map_inprocess()
                 idx = self._find_chunk_index(chunk_id)
                 target = self._data["chunks"][idx]
                 target.update(patch)

@@ -159,3 +159,37 @@ def test_configure_tesseract_cmd_env(monkeypatch, tmp_path) -> None:
     fake.write_bytes(b"")
     monkeypatch.setenv("TESSERACT_CMD_PATH", str(fake))
     assert configure_tesseract_cmd() == str(fake)
+
+
+def test_run_tesseract_ocr_releases_pixmap_before_tesseract(monkeypatch) -> None:
+    """Pixmap rilasciato in finally anche se PIL/Tesseract falliscono dopo."""
+    from engine.v2_physical_extractor import _run_tesseract_ocr
+
+    released: list[str] = []
+
+    class FakePixmap:
+        width = 2
+        height = 2
+        samples = b"\xff" * 12
+
+        def __del__(self) -> None:
+            released.append("pix")
+
+    class FakePage:
+        def get_pixmap(self, dpi: int = 300) -> FakePixmap:
+            return FakePixmap()
+
+    monkeypatch.setattr(
+        "engine.v2_physical_extractor._resolve_tesseract_cmd",
+        lambda: r"C:\fake\tesseract.exe",
+    )
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("tesseract boom - pixmap must already be released")
+
+    monkeypatch.setattr("pytesseract.image_to_string", _boom)
+
+    with pytest.raises(RuntimeError, match="tesseract boom"):
+        _run_tesseract_ocr(FakePage())  # type: ignore[arg-type]
+
+    assert released == ["pix"]

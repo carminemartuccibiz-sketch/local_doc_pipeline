@@ -11,6 +11,7 @@ import hashlib
 import logging
 import os
 import shutil
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -45,6 +46,8 @@ _TESSERACT_DEFAULT_PATHS: tuple[str, ...] = (
     "/usr/local/bin/tesseract",
 )
 
+_TESSERACT_LOCK = threading.Lock()
+
 
 @dataclass(frozen=True, slots=True)
 class ExtractedImage:
@@ -65,18 +68,8 @@ class PhysicalExtractionResult:
     ocr_used: bool = False
 
 
-def configure_tesseract_cmd() -> str | None:
-    """
-    Configura ``pytesseract.pytesseract.tesseract_cmd``.
-
-    Ordine: ``TESSERACT_CMD_PATH`` → percorsi standard → ``PATH``.
-    Restituisce il path risolto o ``None`` se non trovato.
-    """
-    try:
-        import pytesseract
-    except ImportError:
-        return None
-
+def _resolve_tesseract_cmd() -> str | None:
+    """Risolve il path dell'eseguibile Tesseract (senza lock — uso interno)."""
     env_path = os.environ.get("TESSERACT_CMD_PATH", "").strip()
     candidates: list[str] = []
     if env_path:
@@ -89,9 +82,28 @@ def configure_tesseract_cmd() -> str | None:
     for candidate in candidates:
         path = Path(candidate)
         if path.is_file():
-            pytesseract.pytesseract.tesseract_cmd = str(path)
             return str(path)
     return None
+
+
+def configure_tesseract_cmd() -> str | None:
+    """
+    Configura ``pytesseract.pytesseract.tesseract_cmd``.
+
+    Ordine: ``TESSERACT_CMD_PATH`` → percorsi standard → ``PATH``.
+    Restituisce il path risolto o ``None`` se non trovato.
+    Thread-safe: lock condiviso con ``_run_tesseract_ocr``.
+    """
+    try:
+        import pytesseract
+    except ImportError:
+        return None
+
+    with _TESSERACT_LOCK:
+        resolved = _resolve_tesseract_cmd()
+        if resolved:
+            pytesseract.pytesseract.tesseract_cmd = resolved
+        return resolved
 
 
 def _page_content_byte_size(page: fitz.Page) -> int:
@@ -110,18 +122,36 @@ def _needs_ocr_fallback(page: fitz.Page, native_char_count: int) -> bool:
 
 
 def _run_tesseract_ocr(page: fitz.Page, *, dpi: int = OCR_RENDER_DPI) -> str:
-    import pytesseract
-    from PIL import Image
+    """
+    OCR pagina via Tesseract.
 
-    if configure_tesseract_cmd() is None:
-        raise FileNotFoundError("tesseract executable not found")
+    Il ``Pixmap`` MuPDF viene rilasciato in ``finally`` (``pix = None``) anche se
+    ``Image.frombytes`` o ``image_to_string`` sollevano — ``__del__`` fitz non
+    è affidabile su Windows/CPython. I campioni vengono copiati in ``bytes``
+    prima del rilascio così Tesseract non trattiene VRAM durante l'inferenza.
+    Configurazione + ``image_to_string`` sotto ``_TESSERACT_LOCK`` (no race multi-worker).
+    """
+    try:
+        import pytesseract
+    except ImportError:
+        raise FileNotFoundError("tesseract executable not found") from None
+
+    from PIL import Image
 
     pix = page.get_pixmap(dpi=dpi)
     try:
-        img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-        return (pytesseract.image_to_string(img) or "").strip()
+        samples = bytes(pix.samples)
+        width, height = pix.width, pix.height
     finally:
         pix = None  # type: ignore[assignment]
+
+    img = Image.frombytes("RGB", (width, height), samples)
+    with _TESSERACT_LOCK:
+        resolved = _resolve_tesseract_cmd()
+        if resolved is None:
+            raise FileNotFoundError("tesseract executable not found")
+        pytesseract.pytesseract.tesseract_cmd = resolved
+        return (pytesseract.image_to_string(img) or "").strip()
 
 
 class PhysicalExtractor:
@@ -170,6 +200,9 @@ class PhysicalExtractor:
         ocr_used = False
 
         with fitz.open(pdf_path) as doc:
+            # ``doc`` resta aperto per tutta l'estrazione: il ``with`` garantisce
+            # chiusura del file anche se ``_extract_page`` / ``_save_pixmap_png``
+            # sollevano eccezioni (evita lock del PDF su Windows fino al GC).
             pdf_meta = dict(doc.metadata or {})
             atomic_write_json(
                 self.layout.extracted_metadata / PDF_METADATA_NAME,
@@ -256,6 +289,13 @@ class PhysicalExtractor:
         *,
         start_index: int,
     ) -> tuple[str, list[ExtractedImage], int, bool]:
+        """
+        Estrae testo, immagini e OCR opzionale da una singola pagina.
+
+        ``doc`` e ``page`` sono riferimenti al documento aperto da ``extract()``;
+        devono restare entro il ``with fitz.open(...)`` del chiamante.
+        ``fitz.Rect`` in ``_xref_for_bbox`` è un valore leggero — nessun cleanup.
+        """
         blocks = page.get_text("blocks") or []
         blocks = sorted(blocks, key=lambda b: (round(b[1], 2), round(b[0], 2)))
 
@@ -346,6 +386,7 @@ class PhysicalExtractor:
         return page_body, page_images, seq, page_ocr_used
 
     def _try_ocr_page(self, page: fitz.Page, page_no: int) -> str:
+        """OCR fallback; errori Tesseract/Pixmap non propagano al chiamante."""
         try:
             ocr_text = _run_tesseract_ocr(page)
         except Exception as exc:
@@ -364,6 +405,7 @@ class PhysicalExtractor:
 
     @staticmethod
     def _xref_for_bbox(page: fitz.Page, bbox: fitz.Rect) -> int | None:
+        """Trova xref immagine con massima sovrapposizione al bbox (Rect = valore, no leak)."""
         best: tuple[float, int] | None = None
         for img in page.get_images(full=True):
             xref = int(img[0])
@@ -502,8 +544,13 @@ def _save_pixmap_png(doc: fitz.Document, xref: int, out_path: Path) -> str:
     pix = fitz.Pixmap(doc, xref)
     try:
         if pix.n - pix.alpha > 3:
-            pix = fitz.Pixmap(fitz.csRGB, pix)
-        pix.save(str(out_path))
+            rgb = fitz.Pixmap(fitz.csRGB, pix)
+            try:
+                rgb.save(str(out_path))
+            finally:
+                rgb = None  # type: ignore[assignment]
+        else:
+            pix.save(str(out_path))
     finally:
         pix = None  # type: ignore[assignment]
 

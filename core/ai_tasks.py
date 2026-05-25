@@ -1009,3 +1009,149 @@ def write_report(report_path: str, full_md: str) -> None:
         sot_references=[],
         replace=True,
     )
+
+
+# --- V2 multimodal ingest (Vision + rolling facts) ---
+
+V2_FACT_EXTRACT_SYSTEM_PROMPT = """Sei un estrattore di fatti strutturati per documentazione tecnica.
+Rispondi SOLO con JSON valido (nessun markdown fence), schema:
+{
+  "facts": [{"claim": "...", "section": "...", "confidence": "high|medium|low"}],
+  "entities": ["..."],
+  "decisions": ["..."]
+}
+Estrai solo affermazioni verificabili dal testo; non inventare."""
+
+
+def _vision_model_id() -> str:
+    explicit = (
+        os.environ.get("V2_VISION_MODEL", "").strip()
+        or os.environ.get("LM_VISION_MODEL", "").strip()
+    )
+    if explicit:
+        return explicit
+    model = get_session_lm_model()
+    if _is_vl_or_vision_model(model):
+        return model
+    return model
+
+
+def _complete_openai_vision(
+    *,
+    base_url: str,
+    model: str,
+    system_prompt: str,
+    image_b64: str,
+    context_text: str,
+    max_tokens: int,
+    temperature: float = 0.1,
+) -> str:
+    """Chat completions multimodale (LM Studio VL / OpenAI-compatible)."""
+    url = f"{base_url.rstrip('/')}/chat/completions"
+    user_parts: list[dict[str, Any]] = []
+    if context_text.strip():
+        user_parts.append(
+            {
+                "type": "text",
+                "text": f"Contesto documento circostante:\n\n{context_text.strip()}",
+            }
+        )
+    user_parts.append(
+        {
+            "type": "text",
+            "text": "Descrivi il contenuto dell'immagine nel contesto sopra.",
+        }
+    )
+    user_parts.append(
+        {
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{image_b64}"},
+        }
+    )
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_parts},
+        ],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    with _managed_httpx_client() as client:
+        r = _lm_request_guarded(
+            client,
+            "POST",
+            url,
+            json=payload,
+            headers=_auth_headers(),
+        )
+        r.raise_for_status()
+        data = r.json()
+    return data["choices"][0]["message"]["content"].strip()
+
+
+def llm_complete_vision(
+    *,
+    image_b64: str,
+    context_text: str,
+    system_prompt: str,
+    max_tokens: int,
+) -> str:
+    """
+    Caller Vision per ``V2VisionEnricher`` — richiede modello VL su LM Studio.
+
+    Env: ``V2_VISION_MODEL`` / ``LM_VISION_MODEL`` (override), altrimenti session model.
+    """
+    model = _vision_model_id()
+    safe_max = min(max_tokens, int(os.environ.get("V2_VISION_MAX_TOKENS", "512")))
+    with _llm_semaphore:
+        if _backend() == AIBackend.OLLAMA:
+            raise RuntimeError(
+                "Vision multimodale non supportata su backend Ollama in questa build; "
+                "usa AI_BACKEND=lm_studio e un modello VL."
+            )
+        if _backend() == AIBackend.OPENAI:
+            base = os.environ.get("OPENAI_BASE_URL", LM_OPENAI_BASE_URL)
+        else:
+            base = LM_OPENAI_BASE_URL
+        result = _complete_openai_vision(
+            base_url=base,
+            model=model,
+            system_prompt=system_prompt,
+            image_b64=image_b64,
+            context_text=context_text,
+            max_tokens=safe_max,
+        )
+    from engine.cooldown_manager import get_cooldown_manager
+
+    get_cooldown_manager().after_llm_call(_orchestrator_state().stop_event)
+    return result
+
+
+def _strip_json_fence(raw: str) -> str:
+    text = raw.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    return text
+
+
+def llm_extract_facts(*, text: str, context: str, max_tokens: int) -> str:
+    """
+    Caller facts per ``V2RollingMemory`` — testo + contesto rolling → JSON strutturato.
+    """
+    user_message = (
+        f"Contesto rolling precedente (può essere vuoto):\n{context.strip()}\n\n"
+        f"---\n\nTesto chunk da analizzare:\n{text.strip()}"
+    )
+    raw = llm_complete(
+        system_prompt=V2_FACT_EXTRACT_SYSTEM_PROMPT,
+        user_message=user_message,
+        temperature=0.05,
+        max_tokens=max_tokens,
+    )
+    return _strip_json_fence(raw)
