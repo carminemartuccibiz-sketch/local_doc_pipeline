@@ -18,7 +18,7 @@ waitress>=3.0.2,<4.0
 unstructured[pdf,docx]>=0.18.32
 
 # V2 multimodal ingest (Agentic RAG — pymupdf/fitz, OCR, immagini)
-pymupdf>=1.23.0
+pymupdf>=1.27.2.3
 pytesseract>=0.3.10
 Pillow>=10.0.0
 filelock>=3.13,<4.0
