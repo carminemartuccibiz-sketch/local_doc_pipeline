@@ -21,4 +21,4 @@ unstructured[pdf,docx]>=0.18.32
 Pillow>=12.2.0
 pymupdf>=1.27.2.3
 pytesseract>=0.3.13
-filelock>=3.13,<4.0
+filelock>=3.29.4,<4.0
